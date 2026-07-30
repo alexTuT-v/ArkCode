@@ -17,6 +17,7 @@ dist/
 *.egg-info/
 
 .env
+.Arkcode/config.yaml
 .DS_Store
 .idea/
 .vscode/
