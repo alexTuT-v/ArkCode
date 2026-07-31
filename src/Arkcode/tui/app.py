@@ -5,6 +5,7 @@ import os
 import time
 from enum import Enum
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
@@ -12,13 +13,14 @@ from textual.message import Message as TextualMessage
 from textual.timer import Timer
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
-from .. import __version__
+from ..agent import Mode
 from ..config import ProviderConfig
 from ..conversation import Conversation
 from ..llm import Provider, new_provider
-from ..prompt import render_banner
+from ..prompt import EXECUTE_DIRECTIVE, render_banner
+from ..tool import Registry
 from .select import provider_options
-from .stream import StreamControllerMixin
+from .stream import StreamControllerMixin, ToolDisplay
 from .view import (
     error_block,
     render_markdown,
@@ -123,11 +125,20 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
 
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit", priority=True),
+        Binding("escape", "cancel_turn", "Cancel", priority=True),
     ]
 
-    def __init__(self, providers: list[ProviderConfig]) -> None:
+    def __init__(
+        self,
+        providers: list[ProviderConfig],
+        version: str,
+        registry: Registry,
+    ) -> None:
         super().__init__()
         self.providers = providers
+        self._version = version
+        # Textual 的 App 已占用 ``_registry`` 管理 DOM 节点。
+        self._tool_registry = registry
         self.state = (
             SessionState.IDLE if len(providers) == 1 else SessionState.SELECTING
         )
@@ -137,6 +148,15 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         self.turn_start = 0.0
         self._stream_task: asyncio.Task[None] | None = None
         self._timer: Timer | None = None
+        self.mode = Mode.NORMAL
+        self.iter = 0
+        self.usage_in = 0
+        self.usage_out = 0
+        self.usage_cache_read = 0
+        self.usage_cache_creation = 0
+        self.cur_thinking = ""
+        self.cur_tools: list[ToolDisplay] = []
+        self.turn_cancel: asyncio.Event | None = None
 
     def compose(self) -> ComposeResult:
         if len(self.providers) > 1:
@@ -156,7 +176,7 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         yield Static("", id="statusbar")
 
     def on_mount(self) -> None:
-        self.query_one("#log", RichLog).write(render_banner(__version__, os.getcwd()))
+        self.query_one("#log", RichLog).write(render_banner(self._version, os.getcwd()))
         if len(self.providers) == 1:
             self._activate_provider(self.providers[0])
             return
@@ -204,22 +224,42 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
 
         if self.state is not SessionState.IDLE:
             return
-        if text.strip() == "/exit":
+        command = text.strip()
+        if command == "/exit":
             await self.action_quit()
             return
-        if not text.strip():
+        if not command:
             return
 
-        self.conv.add_user(text)
-        self.query_one("#log", RichLog).write(user_block(text))
         input_box = self.query_one("#input", MessageInput)
         input_box.clear()
+        if command == "/plan":
+            self.mode = Mode.PLAN
+            self.query_one("#log", RichLog).write(
+                Text("已进入计划模式（只读工具）", style="dim")
+            )
+            self._update_statusbar()
+            return
+
+        if command == "/do":
+            self.mode = Mode.NORMAL
+            user_text = EXECUTE_DIRECTIVE
+            self._update_statusbar()
+        else:
+            user_text = text
+
+        self.conv.add_user(user_text)
+        self.query_one("#log", RichLog).write(user_block(user_text))
         input_box.disabled = True
         self.cur_reply = ""
+        self.cur_thinking = ""
+        self.cur_tools = []
+        self.iter = 0
+        self.turn_cancel = asyncio.Event()
         self.turn_start = time.monotonic()
         self.state = SessionState.STREAMING
         self._refresh_streaming_view()
-        self._stream_task = asyncio.create_task(self._consume_stream())
+        self._stream_task = asyncio.create_task(self._consume_agent_events())
         self._timer = self.set_interval(0.1, self._tick)
 
     def _tick(self) -> None:
@@ -231,7 +271,13 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
 
     def _refresh_streaming_view(self) -> None:
         self.query_one("#streaming", Static).update(
-            streaming_block(self.cur_reply, int(self._elapsed()))
+            streaming_block(
+                self.cur_reply,
+                int(self._elapsed()),
+                self.cur_tools,
+                self.iter,
+                self.cur_thinking,
+            )
         )
 
     async def _wait_for_streaming_refresh(self) -> None:
@@ -240,7 +286,6 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
     def _finish_with_assistant(self, reply: str) -> None:
         elapsed = self._elapsed()
         self.query_one("#log", RichLog).write(render_markdown(reply, elapsed))
-        self.conv.add_assistant(reply)
         self._finish_turn()
 
     def _finish_with_error(self, error: Exception) -> None:
@@ -256,17 +301,36 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         self._timer = None
         self._stream_task = None
         self.cur_reply = ""
+        self.cur_thinking = ""
+        self.cur_tools = []
+        self.iter = 0
+        self.turn_cancel = None
         self.state = SessionState.IDLE
         self.query_one("#streaming", Static).update("")
         input_box = self.query_one("#input", MessageInput)
         input_box.disabled = False
         input_box.focus()
+        self._update_statusbar()
 
     def _update_statusbar(self) -> None:
         if self.provider is not None:
-            self.query_one("#statusbar", Static).update(status_bar(self.provider))
+            self.query_one("#statusbar", Static).update(
+                status_bar(
+                    self.provider,
+                    self.mode,
+                    self.usage_in,
+                    self.usage_out,
+                    self.usage_cache_read,
+                    self.usage_cache_creation,
+                )
+            )
 
     async def action_quit(self) -> None:
-        if self._stream_task is not None:
-            self._stream_task.cancel()
+        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
+            self.turn_cancel.set()
+            return
         self.exit()
+
+    def action_cancel_turn(self) -> None:
+        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
+            self.turn_cancel.set()

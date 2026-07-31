@@ -2,7 +2,9 @@
 
 import sys
 
+from . import __version__
 from .config import ConfigError, load
+from .tool import new_default_registry
 from .tui.app import ArkCodeApp
 
 
@@ -16,7 +18,11 @@ def main() -> None:
         raise SystemExit(1) from None
 
     try:
-        ArkCodeApp(config.providers).run()
+        ArkCodeApp(
+            config.providers,
+            __version__,
+            new_default_registry(),
+        ).run()
     except KeyboardInterrupt:
         return
     except Exception:
