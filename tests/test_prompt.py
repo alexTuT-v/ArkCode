@@ -1,6 +1,11 @@
 from rich.console import Console
 
-from Arkcode.prompt import render_banner
+from Arkcode.prompt import (
+    EXECUTE_DIRECTIVE,
+    PLAN_MODE_REMINDER,
+    SYSTEM_PROMPT,
+    render_banner,
+)
 
 
 def rendered_text(renderable: object) -> str:
@@ -39,3 +44,18 @@ def test_banner_renders_bright_cyan_body_and_dark_cyan_shadow() -> None:
 
     assert "\x1b[1;38;2;0;255;255m" in styled
     assert "\x1b[38;2;0;139;139m" in styled
+
+
+def test_plan_mode_messages_define_read_only_planning_then_execution() -> None:
+    assert "read_file" in PLAN_MODE_REMINDER
+    assert "write" in PLAN_MODE_REMINDER.lower()
+    assert "/do" in PLAN_MODE_REMINDER
+    assert EXECUTE_DIRECTIVE == "请按上面的计划开始执行。"
+
+
+def test_system_prompt_describes_multi_step_agent_loop() -> None:
+    normalized = " ".join(SYSTEM_PROMPT.split())
+    assert "Keep using tools across multiple steps" in normalized
+    assert "only give your final concise answer once the task is complete" in (
+        normalized
+    )
