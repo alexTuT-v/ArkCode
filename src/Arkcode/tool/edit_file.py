@@ -16,7 +16,10 @@ class EditFileTool(Tool):
         return "edit_file"
 
     def description(self) -> str:
-        return "用新文本替换文件中唯一匹配的原文片段。"
+        return (
+            "用新文本替换文件中唯一匹配的原文片段。"
+            "编辑前请先用 read_file 读取目标文件，并确认 old_string 唯一。"
+        )
 
     def parameters(self) -> dict[str, Any]:
         return {

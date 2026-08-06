@@ -9,9 +9,10 @@ from rich.markdown import Markdown
 from rich.text import Text
 from textual.widgets import RichLog
 
-from ..agent import Agent, Mode, Phase
+from ..agent import Agent, ApprovalRequest, Phase
 from ..conversation import Conversation
 from ..llm import Provider
+from ..permission import Engine, Mode, Outcome
 from ..tool import Registry
 from .view import render_markdown, tool_line, tool_result_summary
 
@@ -40,6 +41,11 @@ class StreamControllerMixin:
     usage_cache_creation: int
     turn_cancel: asyncio.Event | None
     _tool_registry: Registry
+    _version: str
+    engine: Engine | None
+    pending: ApprovalRequest | None
+    approve_cursor: int
+    state: Any
 
     def _refresh_streaming_view(self) -> None:
         raise NotImplementedError
@@ -70,12 +76,23 @@ class StreamControllerMixin:
 
         pending_error: Exception | None = None
         try:
-            agent = Agent(provider, self._tool_registry)
+            agent = Agent(
+                provider,
+                self._tool_registry,
+                self._version,
+                self.engine,
+            )
             cancel = self.turn_cancel
             if cancel is None:
                 self._finish_with_error(RuntimeError("本轮取消事件未初始化"))
                 return
             async for event in agent.run(self.conv, self.mode, cancel):
+                if event.approval is not None:
+                    self.pending = event.approval
+                    self.approve_cursor = 0
+                    self.state = type(self.state).APPROVING
+                    self._refresh_streaming_view()
+                    continue
                 if event.err is not None:
                     pending_error = event.err
                     continue
@@ -143,6 +160,43 @@ class StreamControllerMixin:
             raise
         except Exception as exc:
             self._finish_with_error(exc)
+
+    def update_approving(self, key: str) -> None:
+        """更新批准菜单光标，或把所选结果送回暂停中的 Agent。"""
+
+        request = self.pending
+        if request is None:
+            return
+        if key in {"up", "k"}:
+            self.approve_cursor = (self.approve_cursor - 1) % 3
+            self._refresh_streaming_view()
+            return
+        if key in {"down", "j"}:
+            self.approve_cursor = (self.approve_cursor + 1) % 3
+            self._refresh_streaming_view()
+            return
+
+        indexes = {"1": 0, "2": 1, "3": 2}
+        if key in indexes:
+            self.approve_cursor = indexes[key]
+        elif key == "y":
+            self.approve_cursor = 0
+        elif key in {"n", "d"}:
+            self.approve_cursor = 2
+        elif key not in {"enter", "space"}:
+            return
+
+        outcomes = (
+            Outcome.ALLOW_ONCE,
+            Outcome.ALLOW_FOREVER,
+            Outcome.DENY_ONCE,
+        )
+        outcome = outcomes[self.approve_cursor]
+        self.pending = None
+        self.state = type(self.state).STREAMING
+        self._refresh_streaming_view()
+        if not request.respond.done():
+            request.respond.set_result(outcome)
 
 
 StreamCoroutine = Coroutine[Any, Any, None]

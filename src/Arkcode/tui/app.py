@@ -9,19 +9,22 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
+from textual.events import Key
 from textual.message import Message as TextualMessage
 from textual.timer import Timer
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
-from ..agent import Mode
+from ..agent import ApprovalRequest
 from ..config import ProviderConfig
 from ..conversation import Conversation
 from ..llm import Provider, new_provider
+from ..permission import Engine, Mode, Outcome
 from ..prompt import EXECUTE_DIRECTIVE, render_banner
 from ..tool import Registry
 from .select import provider_options
 from .stream import StreamControllerMixin, ToolDisplay
 from .view import (
+    approval_block,
     error_block,
     render_markdown,
     status_bar,
@@ -36,6 +39,13 @@ class SessionState(Enum):
     SELECTING = "selecting"
     IDLE = "idle"
     STREAMING = "streaming"
+    APPROVING = "approving"
+
+
+def next_mode(mode: Mode) -> Mode:
+    """按 UI 展示顺序循环到下一档权限模式。"""
+
+    return Mode((int(mode) + 1) % len(Mode))
 
 
 class MessageInput(TextArea):
@@ -126,6 +136,7 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit", priority=True),
         Binding("escape", "cancel_turn", "Cancel", priority=True),
+        Binding("shift+tab", "cycle_mode", "Mode", priority=True),
     ]
 
     def __init__(
@@ -133,12 +144,14 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         providers: list[ProviderConfig],
         version: str,
         registry: Registry,
+        engine: Engine | None = None,
     ) -> None:
         super().__init__()
         self.providers = providers
         self._version = version
         # Textual 的 App 已占用 ``_registry`` 管理 DOM 节点。
         self._tool_registry = registry
+        self.engine = engine
         self.state = (
             SessionState.IDLE if len(providers) == 1 else SessionState.SELECTING
         )
@@ -148,7 +161,9 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         self.turn_start = 0.0
         self._stream_task: asyncio.Task[None] | None = None
         self._timer: Timer | None = None
-        self.mode = Mode.NORMAL
+        self.mode = engine.start_mode() if engine is not None else Mode.DEFAULT
+        self.pending: ApprovalRequest | None = None
+        self.approve_cursor = 0
         self.iter = 0
         self.usage_in = 0
         self.usage_out = 0
@@ -219,6 +234,15 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
     async def on_message_input_submitted(self, event: MessageInput.Submitted) -> None:
         await self.submit(event.text)
 
+    def on_key(self, event: Key) -> None:
+        if self.state is not SessionState.APPROVING:
+            return
+        if event.key in {"escape", "ctrl+c"}:
+            return
+        event.prevent_default()
+        event.stop()
+        self.update_approving(event.key)
+
     async def submit(self, text: str) -> None:
         """提交一轮用户输入；流式期间忽略新的提交。"""
 
@@ -242,7 +266,7 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
             return
 
         if command == "/do":
-            self.mode = Mode.NORMAL
+            self.mode = Mode.DEFAULT
             user_text = EXECUTE_DIRECTIVE
             self._update_statusbar()
         else:
@@ -263,13 +287,18 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         self._timer = self.set_interval(0.1, self._tick)
 
     def _tick(self) -> None:
-        if self.state is SessionState.STREAMING:
+        if self.state in (SessionState.STREAMING, SessionState.APPROVING):
             self._refresh_streaming_view()
 
     def _elapsed(self) -> float:
         return max(0.0, time.monotonic() - self.turn_start)
 
     def _refresh_streaming_view(self) -> None:
+        if self.state is SessionState.APPROVING and self.pending is not None:
+            self.query_one("#streaming", Static).update(
+                approval_block(self.pending, self.approve_cursor)
+            )
+            return
         self.query_one("#streaming", Static).update(
             streaming_block(
                 self.cur_reply,
@@ -305,6 +334,8 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         self.cur_tools = []
         self.iter = 0
         self.turn_cancel = None
+        self.pending = None
+        self.approve_cursor = 0
         self.state = SessionState.IDLE
         self.query_one("#streaming", Static).update("")
         input_box = self.query_one("#input", MessageInput)
@@ -326,11 +357,37 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
             )
 
     async def action_quit(self) -> None:
-        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
-            self.turn_cancel.set()
+        if self.state in (SessionState.STREAMING, SessionState.APPROVING):
+            self._cancel_active_turn()
             return
         self.exit()
 
     def action_cancel_turn(self) -> None:
-        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
+        if self.state in (SessionState.STREAMING, SessionState.APPROVING):
+            self._cancel_active_turn()
+
+    def _cancel_active_turn(self) -> None:
+        if self.pending is not None and not self.pending.respond.done():
+            self.pending.respond.set_result(Outcome.DENY_ONCE)
+        if self.turn_cancel is not None:
             self.turn_cancel.set()
+
+    def action_cycle_mode(self) -> None:
+        if self.state is not SessionState.IDLE:
+            return
+        self.mode = next_mode(self.mode)
+        self.query_one("#log", RichLog).write(
+            Text(f"已切换到 {self.mode} 模式", style="dim")
+        )
+        self._update_statusbar()
+
+
+def new_app(
+    providers: list[ProviderConfig],
+    version: str,
+    registry: Registry,
+    engine: Engine,
+) -> ArkCodeApp:
+    """构造注入权限引擎的 TUI 应用。"""
+
+    return ArkCodeApp(providers, version, registry, engine)

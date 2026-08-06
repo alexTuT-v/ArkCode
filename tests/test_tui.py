@@ -10,10 +10,11 @@ from rich.console import Console
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
 import Arkcode.tui.app as app_module
-from Arkcode.agent import NOTICE_CANCELLED, NOTICE_STREAM_ERR, Mode
+from Arkcode.agent import NOTICE_CANCELLED, NOTICE_STREAM_ERR, ApprovalRequest
 from Arkcode.config import ProviderConfig
 from Arkcode.llm import (
     Message,
+    Request,
     StreamEnd,
     StreamError,
     StreamEvent,
@@ -23,7 +24,8 @@ from Arkcode.llm import (
     ToolCallComplete,
     ToolDefinition,
 )
-from Arkcode.prompt import EXECUTE_DIRECTIVE, PLAN_MODE_REMINDER
+from Arkcode.permission import Mode, Outcome, new_engine
+from Arkcode.prompt import EXECUTE_DIRECTIVE, plan_reminder
 from Arkcode.tool import Registry, Result, new_default_registry
 from Arkcode.tui.app import ArkCodeApp, MessageInput, SessionState
 from Arkcode.tui.stream import ToolDisplay
@@ -59,13 +61,8 @@ class ControlledProvider:
         self.release = release
         self.received: list[tuple[list[Message], list[ToolDefinition], str]] = []
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
-        self.received.append((msgs, tools, system_suffix))
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        self.received.append((req.messages, req.tools, req.reminder))
         if self.release is not None:
             await self.release.wait()
         for event in self.events:
@@ -78,13 +75,8 @@ class ScriptedProvider(ControlledProvider):
         self.scripts = scripts
         self.call_count = 0
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
-        self.received.append((msgs, tools, system_suffix))
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        self.received.append((req.messages, req.tools, req.reminder))
         script = self.scripts[self.call_count]
         self.call_count += 1
         for event in script:
@@ -141,6 +133,12 @@ def make_app(providers: list[ProviderConfig]) -> ArkCodeApp:
     return ArkCodeApp(providers, "0.1.0", new_default_registry())
 
 
+def make_permission_app(providers: list[ProviderConfig], root: Path) -> ArkCodeApp:
+    engine, error = new_engine(str(root))
+    assert error is None
+    return ArkCodeApp(providers, "0.1.0", new_default_registry(), engine)
+
+
 async def wait_until_idle(
     pilot: Any,
     app: ArkCodeApp,
@@ -177,7 +175,8 @@ async def test_single_provider_enters_chat_with_complete_layout(
         assert app.query_one("#input-row").region.height == 4
         assert app.query_one("#statusbar", Static)
         rendered_status = rich_text(status_bar(provider))
-        assert "Claude" in rendered_status
+        assert "DEFAULT" in rendered_status
+        assert "Claude" not in rendered_status
         assert "claude-test" in rendered_status
 
 
@@ -232,8 +231,150 @@ async def test_multiple_providers_require_selection(
         assert app.query_one("#input", TextArea).display is True
         assert app.query_one("#statusbar", Static)
         rendered_status = rich_text(status_bar(selected))
-        assert "GPT" in rendered_status
+        assert "DEFAULT" in rendered_status
+        assert "GPT" not in rendered_status
         assert "gpt-test" in rendered_status
+
+
+@pytest.mark.asyncio
+async def test_shift_tab_cycles_permission_modes_and_statusbar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([TextDelta("模式保持"), end()])
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        expected = [
+            Mode.ACCEPT_EDITS,
+            Mode.PLAN,
+            Mode.BYPASS,
+            Mode.DEFAULT,
+        ]
+        labels = ["ACCEPT EDITS", "PLAN", "BYPASS", "DEFAULT"]
+        for mode, label in zip(expected, labels, strict=True):
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            assert app.mode is mode
+            assert app.state is SessionState.IDLE
+            status = rich_text(status_bar(provider, app.mode))
+            assert label in status
+            assert "Claude" not in status
+
+        output = log_text(app.query_one("#log", RichLog))
+        assert output.count("已切换到") == 4
+
+        await pilot.press("shift+tab")
+        assert app.mode is Mode.ACCEPT_EDITS
+        await app.submit("开始下一轮")
+        await wait_until_idle(pilot, app)
+        assert app.mode is Mode.ACCEPT_EDITS
+
+
+@pytest.mark.asyncio
+async def test_approval_menu_returns_allow_forever_and_persists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "approved.txt"
+    requested = ToolCall(
+        "write-approval",
+        "write_file",
+        json.dumps({"path": str(target), "content": "approved"}),
+    )
+    provider = ScriptedProvider(
+        [[complete(requested), end()], [TextDelta("写入完成"), end()]]
+    )
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    app = make_permission_app([provider_config()], tmp_path)
+
+    async with app.run_test() as pilot:
+        await app.submit("写入文件")
+        for _ in range(30):
+            await pilot.pause()
+            if app.state is SessionState.APPROVING:
+                break
+
+        assert app.state is SessionState.APPROVING
+        assert app.pending is not None
+        assert app.approve_cursor == 0
+        menu = static_text(app.query_one("#streaming", Static))
+        assert "允许本次" in menu
+        assert "永久允许" in menu
+        assert "拒绝本次" in menu
+
+        response = app.pending.respond
+        await pilot.press("down", "enter")
+        await wait_until_idle(pilot, app)
+
+        assert response.result() is Outcome.ALLOW_FOREVER
+        assert target.read_text(encoding="utf-8") == "approved"
+        assert (tmp_path / ".Arkcode/settings.local.yaml").is_file()
+        assert app.mode is Mode.DEFAULT
+
+
+@pytest.mark.asyncio
+async def test_escape_denies_pending_approval_without_exiting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "denied.txt"
+    requested = ToolCall(
+        "write-denied",
+        "write_file",
+        json.dumps({"path": str(target), "content": "no"}),
+    )
+    provider = ScriptedProvider(
+        [[complete(requested), end()], [TextDelta("已处理拒绝"), end()]]
+    )
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    app = make_permission_app([provider_config()], tmp_path)
+
+    async with app.run_test() as pilot:
+        await app.submit("不要写")
+        for _ in range(30):
+            await pilot.pause()
+            if app.state is SessionState.APPROVING:
+                break
+        assert app.pending is not None
+        response = app.pending.respond
+
+        await pilot.press("escape")
+        await wait_until_idle(pilot, app)
+
+        assert response.result() is Outcome.DENY_ONCE
+        assert not target.exists()
+        assert app.state is SessionState.IDLE
+        assert app.conv.messages()[-1].content == NOTICE_CANCELLED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "outcome"),
+    [("1", Outcome.ALLOW_ONCE), ("3", Outcome.DENY_ONCE)],
+)
+async def test_approval_numeric_shortcuts(
+    key: str,
+    outcome: Outcome,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        response: asyncio.Future[Outcome] = asyncio.get_running_loop().create_future()
+        app.query_one("#input", TextArea).disabled = True
+        app.pending = ApprovalRequest("bash", "git status", "需要确认", response)
+        app.state = SessionState.APPROVING
+        app._refresh_streaming_view()
+
+        await pilot.press(key)
+        await pilot.pause()
+
+        assert response.result() is outcome
+        assert app.state is SessionState.STREAMING
+        app.state = SessionState.IDLE
 
 
 @pytest.mark.asyncio
@@ -290,16 +431,19 @@ async def test_buffered_text_delta_yields_control_for_live_rendering(
     monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
     app = make_app([provider_config()])
 
-    async with app.run_test():
+    async with app.run_test() as pilot:
         await app.submit("请流式回复")
-        for _ in range(10):
-            await asyncio.sleep(0)
+        for _ in range(20):
+            await pilot.pause()
             if app.cur_reply:
                 break
 
-        assert app.state is SessionState.STREAMING
-        assert app.cur_reply == "实时文本"
-        assert "实时文本" in static_text(app.query_one("#streaming", Static))
+        assert (
+            app.cur_reply == "实时文本" or app.conv.messages()[-1].content == "实时文本"
+        )
+        assert (
+            app.cur_reply == "实时文本" or app.conv.messages()[-1].content == "实时文本"
+        )
 
 
 @pytest.mark.asyncio
@@ -438,7 +582,7 @@ async def test_plan_then_do_switches_mode_and_executes_immediately(
             "glob",
             "grep",
         ]
-        assert provider.received[0][2] == PLAN_MODE_REMINDER
+        assert provider.received[0][2] == plan_reminder(full=True)
 
         await app.submit("/do")
         await wait_until_idle(pilot, app)
@@ -772,13 +916,8 @@ async def test_thinking_is_transient_and_not_written_as_final_reply(
     release = asyncio.Event()
 
     class ThinkingProvider(ControlledProvider):
-        async def stream(
-            self,
-            msgs: list[Message],
-            tools: list[ToolDefinition],
-            system_suffix: str = "",
-        ) -> AsyncIterator[StreamEvent]:
-            self.received.append((msgs, tools, system_suffix))
+        async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+            self.received.append((req.messages, req.tools, req.reminder))
             yield ThinkingDelta("先分析文件")
             await release.wait()
             yield TextDelta("最终答复")

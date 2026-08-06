@@ -9,8 +9,9 @@ from rich.padding import Padding
 from rich.table import Table
 from rich.text import Text
 
-from ..agent import Mode
+from ..agent import ApprovalRequest
 from ..llm import Provider
+from ..permission import Mode
 
 
 class RunningTool(Protocol):
@@ -54,27 +55,54 @@ def _compact_tokens(value: int) -> str:
 
 def status_bar(
     provider: Provider,
-    mode: Mode = Mode.NORMAL,
+    mode: Mode = Mode.DEFAULT,
     usage_in: int = 0,
     usage_out: int = 0,
     usage_cache_read: int = 0,
     usage_cache_creation: int = 0,
 ) -> Table:
-    """渲染 provider、模式、模型与累计 token 用量。"""
+    """渲染当前权限模式、模型与累计 token 用量。"""
 
     table = Table.grid(expand=True)
     table.add_column(justify="left", ratio=1)
     table.add_column(justify="right")
-    provider_label = provider.name
-    if mode is Mode.PLAN:
-        provider_label += "  [PLAN]"
+    labels = {
+        Mode.DEFAULT: ("DEFAULT", "green"),
+        Mode.ACCEPT_EDITS: ("ACCEPT EDITS", "cyan"),
+        Mode.PLAN: ("PLAN", "yellow"),
+        Mode.BYPASS: ("BYPASS", "bold red"),
+    }
+    label, style = labels[mode]
     usage = (
         f"↑{_compact_tokens(usage_in)} ↓{_compact_tokens(usage_out)} tok"
         f" · cache 读 {_compact_tokens(usage_cache_read)}"
         f" / 写 {_compact_tokens(usage_cache_creation)}"
     )
-    table.add_row(provider_label, f"{provider.model}  {usage}")
+    table.add_row(Text(label, style=style), f"{provider.model}  {usage}")
     return table
+
+
+def approval_block(request: ApprovalRequest, cursor: int = 0) -> Text:
+    """渲染人在回路的三选一批准菜单。"""
+
+    choices = (
+        "1. 允许本次",
+        "2. 永久允许（写入本地配置）",
+        "3. 拒绝本次",
+    )
+    block = Text()
+    block.append(f"● {request.name}\n", style="bold cyan")
+    block.append(f"  {request.args}\n", style="bold")
+    block.append(f"  {request.reason}\n", style="dim")
+    block.append("是否继续?\n")
+    for index, choice in enumerate(choices):
+        selected = index == cursor
+        block.append(
+            ("> " if selected else "  ") + choice + "\n",
+            style="reverse bold" if selected else "",
+        )
+    block.append("↑↓ 选择 · 回车确认 · Esc 取消", style="dim")
+    return block
 
 
 def tool_line(name: str, args: str) -> Text:
