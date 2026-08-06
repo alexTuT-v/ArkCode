@@ -18,6 +18,7 @@ dist/
 
 .env
 .Arkcode/config.yaml
+.Arkcode/settings.local.yaml
 .DS_Store
 .idea/
 .vscode/

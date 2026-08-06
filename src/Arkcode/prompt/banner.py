@@ -1,27 +1,6 @@
-"""应用内置提示词与启动横幅。"""
+"""终端启动横幅渲染。"""
 
 from rich.text import Text
-
-SYSTEM_PROMPT = """\
-You are ArkCode, a precise and helpful AI coding agent. You can read, create,
-and edit files, execute shell commands, find files, and search source code
-through the tools provided to you. Use a tool whenever you need information
-from the workspace or need to perform an operation. After receiving tool
-results, answer the user concisely and preserve relevant conversation context.
-Format code and structured explanations with Markdown when useful.
-Keep using tools across multiple steps to make progress, and only give your
-final concise answer once the task is complete.
-"""
-
-PLAN_MODE_REMINDER = (
-    "You are currently in PLAN MODE. You may use ONLY the read-only tools "
-    "(read_file, glob, grep) to investigate the codebase. You must NOT write files, "
-    "edit files, or run shell commands. Produce a clear, step-by-step plan for the "
-    "task, then stop and wait for the user to approve it with /do before doing any "
-    "work."
-)
-
-EXECUTE_DIRECTIVE = "请按上面的计划开始执行。"
 
 ARK_CODE_LOGO = """\
  █████▓  █████▓  ██  ██▓      █████▓  ██████▓  █████▓   █████▓
@@ -43,8 +22,7 @@ def render_banner(version: str, cwd: str) -> Text:
         else:
             banner.append(character)
     banner.append(
-        f"\nArk Code v{version}\n"
-        f"Working directory: {cwd}\n"
+        f"\nArk Code v{version}\nWorking directory: {cwd}\n"
         "Ready — send a message to begin."
     )
     return banner

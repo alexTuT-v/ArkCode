@@ -12,6 +12,7 @@ dependencies = [
   "anthropic>=0.40",
   "openai>=1.50",
   "python-dotenv>=1.0",
+  "PyYAML>=6.0",
   "rich>=13",
   "textual>=0.80",
 ]
@@ -24,6 +25,7 @@ dev = [
   "mypy>=1.10",
   "pytest>=8",
   "pytest-asyncio>=1.0",
+  "pytest-timeout>=2.3",
   "ruff>=0.6",
 ]
 

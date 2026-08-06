@@ -10,11 +10,10 @@ from openai import AsyncStream
 from openai.types.chat import ChatCompletionChunk
 
 from ..config import ProviderConfig
-from ..prompt import SYSTEM_PROMPT
-from ..tool.contracts import ToolDefinition
+from ..tool.base import ToolDefinition
 from . import (
     ROLE_TOOL,
-    Message,
+    Request,
     StreamEnd,
     StreamError,
     StreamEvent,
@@ -23,12 +22,6 @@ from . import (
     ToolCallDelta,
     ToolCallStart,
 )
-
-
-def _effective_system(system_suffix: str) -> str:
-    return (
-        SYSTEM_PROMPT if not system_suffix else SYSTEM_PROMPT + "\n\n" + system_suffix
-    )
 
 
 def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
@@ -45,9 +38,18 @@ def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
     ]
 
 
-def _to_openai_messages(msgs: list[Message]) -> list[dict[str, Any]]:
+def _to_openai_messages(req: Request) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
-    for message in msgs:
+    system = req.system.stable
+    if req.system.environment:
+        system = (
+            f"{system}\n\n{req.system.environment}"
+            if system
+            else req.system.environment
+        )
+    if system:
+        messages.append({"role": "system", "content": system})
+    for message in req.messages:
         if message.role == ROLE_TOOL:
             messages.extend(
                 {
@@ -78,6 +80,8 @@ def _to_openai_messages(msgs: list[Message]) -> list[dict[str, Any]]:
             )
             continue
         messages.append({"role": message.role, "content": message.content})
+    if req.reminder:
+        messages.append({"role": "user", "content": req.reminder})
     return messages
 
 
@@ -100,16 +104,8 @@ class OpenAIProvider:
     def model(self) -> str:
         return self._model
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": _effective_system(system_suffix)},
-            *_to_openai_messages(msgs),
-        ]
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        messages = _to_openai_messages(req)
         try:
             params: dict[str, Any] = {
                 "model": self._model,
@@ -117,8 +113,8 @@ class OpenAIProvider:
                 "stream": True,
                 "stream_options": {"include_usage": True},
             }
-            if tools:
-                params["tools"] = _to_openai_tools(tools)
+            if req.tools:
+                params["tools"] = _to_openai_tools(req.tools)
             response = await self._client.chat.completions.create(
                 **params,
             )

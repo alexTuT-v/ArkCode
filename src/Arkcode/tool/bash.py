@@ -49,7 +49,11 @@ class BashTool(Tool):
         return "bash"
 
     def description(self) -> str:
-        return "在当前工作目录执行 shell 命令并返回输出和退出码。"
+        return (
+            "在当前工作目录执行 shell 命令并返回输出和退出码。"
+            "读文件、找文件、搜内容请优先使用 read_file、glob、grep，"
+            "不要用 bash 拼凑。"
+        )
 
     def parameters(self) -> dict[str, Any]:
         return {

@@ -8,13 +8,15 @@ from typing import Any
 import anthropic
 
 from ..config import ProviderConfig
-from ..prompt import SYSTEM_PROMPT
+from ..tool.base import ToolDefinition
 from . import (
     ROLE_TOOL,
     Message,
+    Request,
     StreamEnd,
     StreamError,
     StreamEvent,
+    System,
     TextDelta,
     ThinkingComplete,
     ThinkingDelta,
@@ -22,12 +24,6 @@ from . import (
     ToolCallDelta,
     ToolCallStart,
 )
-from ..tool.base import ToolDefinition
-
-def _effective_system(system_suffix: str) -> str:
-    return (
-        SYSTEM_PROMPT if not system_suffix else SYSTEM_PROMPT + "\n\n" + system_suffix
-    )
 
 
 def _to_anthropic_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
@@ -39,6 +35,23 @@ def _to_anthropic_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
         }
         for tool in tools
     ]
+
+
+def _to_anthropic_system(system: System) -> list[dict[str, Any]]:
+    """把稳定块和环境块序列化到不同缓存通道。"""
+
+    blocks: list[dict[str, Any]] = []
+    if system.stable:
+        blocks.append(
+            {
+                "type": "text",
+                "text": system.stable,
+                "cache_control": {"type": "ephemeral"},
+            }
+        )
+    if system.environment:
+        blocks.append({"type": "text", "text": system.environment})
+    return blocks
 
 
 def _to_anthropic_messages(msgs: list[Message]) -> list[dict[str, Any]]:
@@ -87,6 +100,20 @@ def _to_anthropic_messages(msgs: list[Message]) -> list[dict[str, Any]]:
     return messages
 
 
+def _append_reminder_anthropic(messages: list[dict[str, Any]], reminder: str) -> None:
+    """把 reminder 织入末条 user，保持 Anthropic 角色序列合法。"""
+
+    block = {"type": "text", "text": reminder}
+    if not messages or messages[-1]["role"] != "user":
+        messages.append({"role": "user", "content": [block]})
+        return
+    content = messages[-1]["content"]
+    if not isinstance(content, list):
+        messages[-1]["content"] = [{"type": "text", "text": content}, block]
+        return
+    content.append(block)
+
+
 class AnthropicProvider:
     """把 Anthropic SDK 事件转换为统一的 ``StreamEvent``。"""
 
@@ -107,20 +134,19 @@ class AnthropicProvider:
     def model(self) -> str:
         return self._model
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        system = _to_anthropic_system(req.system)
+        messages = _to_anthropic_messages(req.messages)
+        if req.reminder:
+            _append_reminder_anthropic(messages, req.reminder)
         params: dict[str, Any] = {
             "model": self._model,
             "max_tokens": 4096,
-            "system": _effective_system(system_suffix),
-            "messages": _to_anthropic_messages(msgs),
+            "system": system,
+            "messages": messages,
         }
-        if tools:
-            params["tools"] = _to_anthropic_tools(tools)
+        if req.tools:
+            params["tools"] = _to_anthropic_tools(req.tools)
         if self._thinking:
             params["thinking"] = {"type": "enabled", "budget_tokens": 2048}
 
@@ -207,6 +233,7 @@ class AnthropicProvider:
                 output_tokens=getattr(usage, "output_tokens", 0),
                 cache_read=getattr(usage, "cache_read_input_tokens", 0),
                 cache_creation=getattr(usage, "cache_creation_input_tokens", 0),
+                cache_write=getattr(usage, "cache_creation_input_tokens", 0),
             )
         except asyncio.CancelledError:
             raise

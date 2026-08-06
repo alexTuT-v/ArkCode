@@ -13,8 +13,8 @@ import pytest
 
 from Arkcode.llm import ROLE_TOOL, Message, StreamEnd
 from Arkcode.tool import new_default_registry
-from Arkcode.tool.bash import _read_bounded_stream
 from Arkcode.tool.base import Result, Tool, ToolDefinition
+from Arkcode.tool.bash import _read_bounded_stream
 from Arkcode.tool.grep_tool import GrepTool, _search_in_subprocess
 from Arkcode.tool.read_file import ReadFileTool
 from Arkcode.tool.registry import Registry
@@ -156,6 +156,21 @@ async def test_bash_returns_output_exit_code_and_timeout() -> None:
     assert "problem" in result.content
     assert timeout.is_error is True
     assert "超时" in timeout.content
+
+
+def test_tool_descriptions_reinforce_dedicated_read_and_read_before_edit() -> None:
+    registry = new_default_registry()
+    bash = registry.get("bash")
+    edit = registry.get("edit_file")
+
+    assert bash is not None
+    assert edit is not None
+    bash_description = bash.description()
+    edit_description = edit.description()
+    assert all(name in bash_description for name in ("read_file", "glob", "grep"))
+    assert "优先" in bash_description
+    assert "read_file" in edit_description
+    assert "编辑前" in edit_description
 
 
 @pytest.mark.asyncio

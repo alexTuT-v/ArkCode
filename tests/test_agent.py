@@ -4,6 +4,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -22,6 +23,7 @@ from Arkcode.agent import (
 from Arkcode.conversation import Conversation
 from Arkcode.llm import (
     Message,
+    Request,
     StreamEnd,
     StreamError,
     StreamEvent,
@@ -32,7 +34,8 @@ from Arkcode.llm import (
     ToolCallComplete,
     ToolDefinition,
 )
-from Arkcode.prompt import PLAN_MODE_REMINDER
+from Arkcode.permission import Decision, Outcome, new_engine
+from Arkcode.prompt import plan_reminder
 from Arkcode.tool import Registry, Result
 
 
@@ -44,14 +47,11 @@ class FakeProvider:
         self.scripts = scripts
         self.call_count = 0
         self.received: list[tuple[list[Message], list[ToolDefinition], str]] = []
+        self.requests: list[Request] = []
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
-        self.received.append((msgs, tools, system_suffix))
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        self.requests.append(req)
+        self.received.append((req.messages, req.tools, req.reminder))
         script = self.scripts[self.call_count]
         self.call_count += 1
         for event in script:
@@ -63,13 +63,9 @@ class RepeatingToolProvider(FakeProvider):
         super().__init__([])
         self.tool_name = tool_name
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
-        self.received.append((msgs, tools, system_suffix))
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        self.requests.append(req)
+        self.received.append((req.messages, req.tools, req.reminder))
         self.call_count += 1
         yield ToolCallComplete(
             tool_id=f"call-{self.call_count}",
@@ -85,13 +81,9 @@ class BlockingProvider(FakeProvider):
         self.started = asyncio.Event()
         self.closed = asyncio.Event()
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
-        self.received.append((msgs, tools, system_suffix))
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        self.requests.append(req)
+        self.received.append((req.messages, req.tools, req.reminder))
         self.started.set()
         try:
             await asyncio.Event().wait()
@@ -413,7 +405,71 @@ async def test_plan_mode_exposes_only_read_only_tools_and_suffix() -> None:
 
     _, tools, suffix = provider.received[0]
     assert [tool.name for tool in tools] == ["read_file"]
-    assert suffix == PLAN_MODE_REMINDER
+    assert suffix == plan_reminder(full=True)
+    assert provider.requests[0].system.stable
+    assert provider.requests[0].system.environment
+
+
+@pytest.mark.asyncio
+async def test_plan_reminder_frequency_and_history_isolation() -> None:
+    scripts = [
+        [complete(call(f"read-{index}", "read_file")), end()] for index in range(1, 5)
+    ]
+    scripts.append([TextDelta("计划完成"), end()])
+    provider = FakeProvider(scripts)
+    conversation = Conversation()
+    conversation.add_user("多轮调研后给计划")
+
+    await collect(
+        Agent(provider, registry_with(InstrumentedTool("read_file", True))),
+        conversation,
+        mode=Mode.PLAN,
+    )
+
+    assert [request.reminder for request in provider.requests] == [
+        plan_reminder(full=True),
+        plan_reminder(full=False),
+        plan_reminder(full=False),
+        plan_reminder(full=False),
+        plan_reminder(full=True),
+    ]
+    assert all(
+        "<system-reminder>" not in message.content
+        for message in conversation.messages()
+    )
+
+
+@pytest.mark.asyncio
+async def test_stable_system_is_identical_across_default_and_plan_modes() -> None:
+    registry = registry_with(
+        InstrumentedTool("read_file", True),
+        InstrumentedTool("write_file", False),
+    )
+    default_provider = FakeProvider([[TextDelta("普通完成"), end()]])
+    plan_provider = FakeProvider([[TextDelta("计划完成"), end()]])
+    default_conversation = Conversation()
+    plan_conversation = Conversation()
+    default_conversation.add_user("执行")
+    plan_conversation.add_user("计划")
+
+    await collect(Agent(default_provider, registry), default_conversation)
+    await collect(
+        Agent(plan_provider, registry),
+        plan_conversation,
+        mode=Mode.PLAN,
+    )
+
+    default_request = default_provider.requests[0]
+    plan_request = plan_provider.requests[0]
+    assert default_request.system.stable == plan_request.system.stable
+    assert default_request.system.stable
+    assert default_request.system.environment
+    assert plan_request.system.environment
+    assert [tool.name for tool in default_request.tools] == [
+        "read_file",
+        "write_file",
+    ]
+    assert [tool.name for tool in plan_request.tools] == ["read_file"]
 
 
 @pytest.mark.asyncio
@@ -518,7 +574,14 @@ async def test_agent_preserves_thinking_and_forwards_cache_usage_once() -> None:
                 ThinkingDelta("先分析"),
                 ThinkingComplete("先分析", "signed-thought"),
                 complete(tool),
-                StreamEnd("tool_use", 20, 3, 11, 5),
+                StreamEnd(
+                    "tool_use",
+                    20,
+                    3,
+                    cache_read=11,
+                    cache_creation=5,
+                    cache_write=5,
+                ),
             ],
             [TextDelta("完成"), StreamEnd("end_turn", 30, 4, 12, 0)],
         ]
@@ -538,10 +601,11 @@ async def test_agent_preserves_thinking_and_forwards_cache_usage_once() -> None:
             event.usage.output,
             event.usage.cache_read,
             event.usage.cache_creation,
+            event.usage.cache_write,
         )
         for event in events
         if event.usage
-    ] == [(20, 3, 11, 5), (30, 4, 12, 0)]
+    ] == [(20, 3, 11, 5, 5), (30, 4, 12, 0, 0)]
     first_assistant = conversation.messages()[1]
     assert first_assistant.thinking == "先分析"
     assert first_assistant.thinking_signature == "signed-thought"
@@ -569,3 +633,249 @@ async def test_agent_preserves_signed_thinking_on_a_final_text_reply() -> None:
     assert message.content == "最终答复"
     assert message.thinking == "先推理"
     assert message.thinking_signature == "final-signature"
+
+
+def permission_call(call_id: str, name: str, path: str, label: str) -> ToolCall:
+    return ToolCall(
+        id=call_id,
+        name=name,
+        input=json.dumps({"path": path, "label": label}),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "executed", "is_error"),
+    [
+        (Outcome.ALLOW_ONCE, True, False),
+        (Outcome.DENY_ONCE, False, True),
+    ],
+)
+async def test_permission_approval_controls_side_effect_execution(
+    tmp_path: Path,
+    outcome: Outcome,
+    executed: bool,
+    is_error: bool,
+) -> None:
+    tracker = Tracker()
+    requested = permission_call("write-1", "write_file", "result.txt", "write")
+    provider = FakeProvider(
+        [[complete(requested), end()], [TextDelta("继续完成"), end()]]
+    )
+    conversation = Conversation()
+    conversation.add_user("写文件")
+    engine, _ = new_engine(str(tmp_path))
+    agent = Agent(
+        provider,
+        registry_with(InstrumentedTool("write_file", False, tracker=tracker)),
+        engine=engine,
+    )
+    approvals = []
+
+    async for event in agent.run(conversation, Mode.DEFAULT, asyncio.Event()):
+        if event.approval is not None:
+            approvals.append(event.approval)
+            event.approval.respond.set_result(outcome)
+
+    assert len(approvals) == 1
+    assert bool(tracker.starts) is executed
+    result = conversation.messages()[2].tool_results[0]
+    assert result.tool_call_id == "write-1"
+    assert result.is_error is is_error
+    assert provider.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_permission_allow_forever_persists_and_reloads(tmp_path: Path) -> None:
+    tracker = Tracker()
+    requested = permission_call("write-1", "write_file", "saved.txt", "write")
+    provider = FakeProvider(
+        [[complete(requested), end()], [TextDelta("已保存"), end()]]
+    )
+    conversation = Conversation()
+    conversation.add_user("永久放行")
+    engine, _ = new_engine(str(tmp_path))
+    agent = Agent(
+        provider,
+        registry_with(InstrumentedTool("write_file", False, tracker=tracker)),
+        engine=engine,
+    )
+
+    async for event in agent.run(conversation, Mode.DEFAULT, asyncio.Event()):
+        if event.approval is not None:
+            event.approval.respond.set_result(Outcome.ALLOW_FOREVER)
+
+    assert tracker.starts == ["write"]
+    assert Path(engine.local_path).is_file()
+    reloaded, _ = new_engine(str(tmp_path))
+    decision, _ = reloaded.check(Mode.DEFAULT, requested, False)
+    assert decision is Decision.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_permission_read_batch_denies_outside_and_preserves_order(
+    tmp_path: Path,
+) -> None:
+    tracker = Tracker()
+    outside = permission_call("outside", "read_file", "/etc/passwd", "outside")
+    inside = permission_call("inside", "read_file", "inside.txt", "inside")
+    provider = FakeProvider(
+        [
+            [complete(outside), complete(inside), end()],
+            [TextDelta("已调整"), end()],
+        ]
+    )
+    conversation = Conversation()
+    conversation.add_user("读取两个路径")
+    engine, _ = new_engine(str(tmp_path))
+
+    events = await collect(
+        Agent(
+            provider,
+            registry_with(InstrumentedTool("read_file", True, tracker=tracker)),
+            engine=engine,
+        ),
+        conversation,
+    )
+
+    assert not [event for event in events if event.approval is not None]
+    results = conversation.messages()[2].tool_results
+    assert [result.tool_call_id for result in results] == ["outside", "inside"]
+    assert [result.is_error for result in results] == [True, False]
+    assert tracker.starts == ["inside"]
+
+
+@pytest.mark.asyncio
+async def test_permission_cancel_while_waiting_for_approval_is_clean(
+    tmp_path: Path,
+) -> None:
+    requested = permission_call("write-1", "write_file", "x.txt", "write")
+    provider = FakeProvider([[complete(requested), end()]])
+    conversation = Conversation()
+    conversation.add_user("取消批准")
+    engine, _ = new_engine(str(tmp_path))
+    cancel = asyncio.Event()
+
+    async for event in Agent(
+        provider,
+        registry_with(InstrumentedTool("write_file", False)),
+        engine=engine,
+    ).run(conversation, Mode.DEFAULT, cancel):
+        if event.approval is not None:
+            cancel.set()
+
+    assert conversation.last_role() == "assistant"
+    assert conversation.messages()[-1].content == NOTICE_CANCELLED
+    assert conversation.messages()[-2].tool_results[0].is_error is True
+
+
+@pytest.mark.asyncio
+async def test_accept_edits_allows_write_but_still_asks_for_exec(
+    tmp_path: Path,
+) -> None:
+    tracker = Tracker()
+    write = permission_call("write", "write_file", "ok.txt", "write")
+    bash = ToolCall(
+        id="bash",
+        name="bash",
+        input=json.dumps({"command": "git status", "label": "bash"}),
+    )
+    provider = FakeProvider(
+        [[complete(write), complete(bash), end()], [TextDelta("完成"), end()]]
+    )
+    conversation = Conversation()
+    conversation.add_user("写入并检查")
+    engine, _ = new_engine(str(tmp_path))
+    agent = Agent(
+        provider,
+        registry_with(
+            InstrumentedTool("write_file", False, tracker=tracker),
+            InstrumentedTool("bash", False, tracker=tracker),
+        ),
+        engine=engine,
+    )
+    approvals = []
+
+    async for event in agent.run(
+        conversation,
+        Mode.ACCEPT_EDITS,
+        asyncio.Event(),
+    ):
+        if event.approval is not None:
+            approvals.append(event.approval.name)
+            event.approval.respond.set_result(Outcome.DENY_ONCE)
+
+    assert tracker.starts == ["write"]
+    assert approvals == ["bash"]
+    assert [r.is_error for r in conversation.messages()[2].tool_results] == [
+        False,
+        True,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_denied_outside_write_is_recovered_with_inside_path(
+    tmp_path: Path,
+) -> None:
+    tracker = Tracker()
+    outside = permission_call("outside", "write_file", "../escape.txt", "outside")
+    inside = permission_call("inside", "write_file", "inside.txt", "inside")
+    provider = FakeProvider(
+        [
+            [complete(outside), end()],
+            [complete(inside), end()],
+            [TextDelta("已改用项目内路径"), end()],
+        ]
+    )
+    conversation = Conversation()
+    conversation.add_user("写入文件")
+    engine, _ = new_engine(str(tmp_path))
+    agent = Agent(
+        provider,
+        registry_with(InstrumentedTool("write_file", False, tracker=tracker)),
+        engine=engine,
+    )
+
+    async for event in agent.run(conversation, Mode.DEFAULT, asyncio.Event()):
+        if event.approval is not None:
+            event.approval.respond.set_result(Outcome.ALLOW_ONCE)
+
+    first = conversation.messages()[2].tool_results[0]
+    second = conversation.messages()[4].tool_results[0]
+    assert first.is_error is True
+    assert "项目目录之外" in first.content
+    assert second.is_error is False
+    assert tracker.starts == ["inside"]
+    assert conversation.messages()[-1].content == "已改用项目内路径"
+
+
+@pytest.mark.asyncio
+async def test_direct_cancel_during_approval_closes_future_and_history(
+    tmp_path: Path,
+) -> None:
+    requested = permission_call("write", "write_file", "x.txt", "write")
+    provider = FakeProvider([[complete(requested), end()]])
+    conversation = Conversation()
+    conversation.add_user("等待审批")
+    engine, _ = new_engine(str(tmp_path))
+    approval_ready: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+
+    async def consume() -> None:
+        async for event in Agent(
+            provider,
+            registry_with(InstrumentedTool("write_file", False)),
+            engine=engine,
+        ).run(conversation, Mode.DEFAULT, asyncio.Event()):
+            if event.approval is not None and not approval_ready.done():
+                approval_ready.set_result(event.approval)
+
+    task = asyncio.create_task(consume())
+    approval = await asyncio.wait_for(approval_ready, timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert approval.respond.cancelled()
+    assert conversation.last_role() == "assistant"
+    assert conversation.messages()[-1].content == NOTICE_CANCELLED
+    assert conversation.messages()[-2].tool_results[0].tool_call_id == "write"
