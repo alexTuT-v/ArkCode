@@ -18,6 +18,7 @@ from ..agent import ApprovalRequest
 from ..config import ProviderConfig
 from ..conversation import Conversation
 from ..llm import Provider, new_provider
+from ..mcp import McpStatus
 from ..permission import Engine, Mode, Outcome
 from ..prompt import EXECUTE_DIRECTIVE, render_banner
 from ..tool import Registry
@@ -26,6 +27,7 @@ from .stream import StreamControllerMixin, ToolDisplay
 from .view import (
     approval_block,
     error_block,
+    mcp_status_line,
     render_markdown,
     status_bar,
     streaming_block,
@@ -145,6 +147,7 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         version: str,
         registry: Registry,
         engine: Engine | None = None,
+        mcp_status: McpStatus | None = None,
     ) -> None:
         super().__init__()
         self.providers = providers
@@ -152,6 +155,7 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         # Textual 的 App 已占用 ``_registry`` 管理 DOM 节点。
         self._tool_registry = registry
         self.engine = engine
+        self.mcp_status = mcp_status
         self.state = (
             SessionState.IDLE if len(providers) == 1 else SessionState.SELECTING
         )
@@ -191,7 +195,12 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         yield Static("", id="statusbar")
 
     def on_mount(self) -> None:
-        self.query_one("#log", RichLog).write(render_banner(self._version, os.getcwd()))
+        log = self.query_one("#log", RichLog)
+        log.write(render_banner(self._version, os.getcwd()))
+        if self.mcp_status is not None:
+            summary = mcp_status_line(self.mcp_status)
+            if summary is not None:
+                log.write(summary)
         if len(self.providers) == 1:
             self._activate_provider(self.providers[0])
             return
@@ -387,7 +396,8 @@ def new_app(
     version: str,
     registry: Registry,
     engine: Engine,
+    mcp_status: McpStatus | None = None,
 ) -> ArkCodeApp:
     """构造注入权限引擎的 TUI 应用。"""
 
-    return ArkCodeApp(providers, version, registry, engine)
+    return ArkCodeApp(providers, version, registry, engine, mcp_status)

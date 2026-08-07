@@ -21,19 +21,25 @@ class RuleSet:
 
     def match(self, friendly: str, target: str) -> tuple[Decision, bool]:
         for rule in self.deny:
-            if rule.tool == friendly and match_pattern(rule.pattern, target):
+            if match_pattern(rule.tool, friendly) and match_pattern(
+                rule.pattern, target
+            ):
                 return Decision.DENY, True
         for rule in self.ask:
-            if rule.tool == friendly and match_pattern(rule.pattern, target):
+            if match_pattern(rule.tool, friendly) and match_pattern(
+                rule.pattern, target
+            ):
                 return Decision.ASK, True
         for rule in self.allow:
-            if rule.tool == friendly and match_pattern(rule.pattern, target):
+            if match_pattern(rule.tool, friendly) and match_pattern(
+                rule.pattern, target
+            ):
                 return Decision.ALLOW, True
         return Decision.ALLOW, False
 
 
 def parse_rule(value: str, allow: bool = True) -> tuple[Rule, bool]:
-    match = re.fullmatch(r"([A-Za-z]+)(?:\((.*)\))?", value.strip())
+    match = re.fullmatch(r"([A-Za-z0-9_*-]+)(?:\((.*)\))?", value.strip())
     if match is None or not match.group(1):
         return Rule("", "", allow), False
     return Rule(match.group(1), match.group(2) or "", allow), True

@@ -10,6 +10,7 @@ from rich.console import Console
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
 import Arkcode.tui.app as app_module
+import Arkcode.tui.view as view_module
 from Arkcode.agent import NOTICE_CANCELLED, NOTICE_STREAM_ERR, ApprovalRequest
 from Arkcode.config import ProviderConfig
 from Arkcode.llm import (
@@ -24,6 +25,7 @@ from Arkcode.llm import (
     ToolCallComplete,
     ToolDefinition,
 )
+from Arkcode.mcp import McpStatus
 from Arkcode.permission import Mode, Outcome, new_engine
 from Arkcode.prompt import EXECUTE_DIRECTIVE, plan_reminder
 from Arkcode.tool import Registry, Result, new_default_registry
@@ -121,6 +123,28 @@ def rich_text(renderable: object) -> str:
     return console.export_text()
 
 
+def test_mcp_status_line_reports_partial_failure() -> None:
+    line = view_module.mcp_status_line(McpStatus(2, 1, 3))
+
+    assert line is not None
+    assert rich_text(line).strip() == (
+        "MCP 1/2 servers connected · 3 tools registered · 1 failed"
+    )
+    assert str(line.style) == "dim"
+    assert any(str(span.style) == "yellow" for span in line.spans)
+
+
+def test_mcp_status_line_omits_failure_when_all_servers_connect() -> None:
+    line = view_module.mcp_status_line(McpStatus(2, 2, 5))
+
+    assert line is not None
+    assert rich_text(line).strip() == ("MCP 2/2 servers connected · 5 tools registered")
+
+
+def test_mcp_status_line_is_absent_without_configured_servers() -> None:
+    assert view_module.mcp_status_line(McpStatus(0, 0, 0)) is None
+
+
 def complete(call: ToolCall) -> ToolCallComplete:
     return ToolCallComplete(call.id, call.name, json.loads(call.input))
 
@@ -181,12 +205,64 @@ async def test_single_provider_enters_chat_with_complete_layout(
 
 
 @pytest.mark.asyncio
+async def test_single_provider_shows_mcp_summary_after_banner_only_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([TextDelta("完成"), end()])
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    app = ArkCodeApp(
+        [provider_config()],
+        "0.1.0",
+        new_default_registry(),
+        mcp_status=McpStatus(2, 1, 3),
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        output = log_text(app.query_one("#log", RichLog))
+        summary = "MCP 1/2 servers connected · 3 tools registered · 1 failed"
+
+        assert output.index("Ark Code v0.1.0") < output.index(summary)
+        assert output.count(summary) == 1
+
+        await pilot.press("shift+tab")
+        await app.submit("继续")
+        await wait_until_idle(pilot, app)
+
+        assert log_text(app.query_one("#log", RichLog)).count(summary) == 1
+
+
+@pytest.mark.asyncio
+async def test_zero_mcp_status_does_not_add_startup_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    app = ArkCodeApp(
+        [provider_config()],
+        "0.1.0",
+        new_default_registry(),
+        mcp_status=McpStatus(0, 0, 0),
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        assert "MCP " not in log_text(app.query_one("#log", RichLog))
+
+
+@pytest.mark.asyncio
 async def test_80x24_layout_keeps_conversation_visible_and_input_aligned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = ControlledProvider([])
     monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
-    app = make_app([provider_config()])
+    app = ArkCodeApp(
+        [provider_config()],
+        "0.1.0",
+        new_default_registry(),
+        mcp_status=McpStatus(1, 1, 0),
+    )
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
@@ -199,7 +275,9 @@ async def test_80x24_layout_keeps_conversation_visible_and_input_aligned(
 
         assert len(log.lines) <= log.content_region.height
         assert "Ark Code v0.1.0" in log_text(log)
+        assert "MCP 1/1 servers connected · 0 tools registered" in log_text(log)
         assert prompt.content_region.y == input_box.content_region.y
+        assert log.region.intersection(input_row.region).area == 0
         assert input_row.region.intersection(status.region).area == 0
 
 
@@ -234,6 +312,33 @@ async def test_multiple_providers_require_selection(
         assert "DEFAULT" in rendered_status
         assert "GPT" not in rendered_status
         assert "gpt-test" in rendered_status
+
+
+@pytest.mark.asyncio
+async def test_multiple_provider_selection_reveals_mcp_summary_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = ControlledProvider([], name="GPT", model="gpt-test")
+    monkeypatch.setattr(app_module, "new_provider", lambda config: selected)
+    app = ArkCodeApp(
+        [
+            provider_config(),
+            provider_config(name="GPT", model="gpt-test"),
+        ],
+        "0.1.0",
+        new_default_registry(),
+        mcp_status=McpStatus(2, 0, 0),
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.press("down", "enter")
+        await pilot.pause()
+
+        output = log_text(app.query_one("#log", RichLog))
+        assert (
+            output.count("MCP 0/2 servers connected · 0 tools registered · 2 failed")
+            == 1
+        )
 
 
 @pytest.mark.asyncio

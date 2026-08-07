@@ -210,6 +210,28 @@ def test_settings_error_degrades_without_losing_other_layers(tmp_path: Path) -> 
     )
 
 
+def test_invalid_mcp_section_does_not_hide_valid_project_permissions(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / ".Arkcode"
+    config.mkdir()
+    (config / "settings.yaml").write_text(
+        "default_mode: acceptEdits\n"
+        "permissions:\n  allow: ['Bash(git status)']\n"
+        "mcp_servers: []\n",
+        encoding="utf-8",
+    )
+
+    engine, error = new_engine(str(tmp_path))
+
+    assert error is None
+    assert engine.start_mode() is Mode.ACCEPT_EDITS
+    assert (
+        engine.check(Mode.DEFAULT, call("bash", {"command": "git status"}), False)[0]
+        is Decision.ALLOW
+    )
+
+
 def test_engine_creation_failure_returns_safe_engine(tmp_path: Path) -> None:
     missing = tmp_path / "does-not-exist"
     engine, error = new_engine(str(missing))
@@ -232,3 +254,41 @@ def test_engine_creation_failure_returns_safe_engine(tmp_path: Path) -> None:
 )
 def test_all_core_tools_have_friendly_names(internal: str, friendly: str) -> None:
     assert friendly_name(internal) == friendly
+
+
+def test_mcp_namespaced_rules_support_exact_and_server_wildcard(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / ".Arkcode"
+    config.mkdir()
+    (config / "settings.yaml").write_text(
+        "permissions:\n"
+        "  allow: ['mcp__github__*']\n"
+        "  deny: ['mcp__github__delete_repo']\n",
+        encoding="utf-8",
+    )
+    engine, error = new_engine(str(tmp_path))
+
+    assert error is None
+    assert (
+        engine.check(Mode.DEFAULT, call("mcp__github__list_issues", {}), False)[0]
+        is Decision.ALLOW
+    )
+    assert (
+        engine.check(Mode.BYPASS, call("mcp__github__delete_repo", {}), False)[0]
+        is Decision.DENY
+    )
+
+
+def test_mcp_permission_fallback_and_persisted_allow(tmp_path: Path) -> None:
+    engine, error = new_engine(str(tmp_path))
+    remote = call("mcp__demo__echo", {"value": "hello"})
+
+    assert error is None
+    assert engine.check(Mode.DEFAULT, remote, True)[0] is Decision.ALLOW
+    assert engine.check(Mode.DEFAULT, remote, False)[0] is Decision.ASK
+    assert engine.check(Mode.BYPASS, remote, False)[0] is Decision.ALLOW
+
+    engine.persist_local_allow(remote)
+    reloaded, _ = new_engine(str(tmp_path))
+    assert reloaded.check(Mode.DEFAULT, remote, False)[0] is Decision.ALLOW

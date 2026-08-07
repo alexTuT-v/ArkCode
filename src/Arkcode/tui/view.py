@@ -11,6 +11,7 @@ from rich.text import Text
 
 from ..agent import ApprovalRequest
 from ..llm import Provider
+from ..mcp import McpStatus
 from ..permission import Mode
 
 
@@ -44,6 +45,21 @@ def error_block(message: str, elapsed: float) -> Text:
     """渲染可区分且带耗时的错误消息。"""
 
     return Text(f"● {message}\nFailed after {elapsed:.1f}s", style="bold red")
+
+
+def mcp_status_line(status: McpStatus) -> Text | None:
+    """渲染一次性的 MCP 启动汇总；零配置时不占用界面。"""
+
+    if status.configured_servers == 0:
+        return None
+    line = Text(
+        f"MCP {status.connected_servers}/{status.configured_servers} "
+        f"servers connected · {status.registered_tools} tools registered",
+        style="dim",
+    )
+    if status.failed_servers > 0:
+        line.append(f" · {status.failed_servers} failed", style="yellow")
+    return line
 
 
 def _compact_tokens(value: int) -> str:

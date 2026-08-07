@@ -1,8 +1,13 @@
 from pathlib import Path
+from typing import Any
 
+import mcp.types as mtypes
 import pytest
 
 from Arkcode import cli
+from Arkcode.mcp import Config, McpStatus
+from Arkcode.mcp.tool import McpTool
+from Arkcode.tool import Registry
 from Arkcode.tui.app import ArkCodeApp
 
 
@@ -25,12 +30,12 @@ def test_main_starts_with_root_dotenv(
 ) -> None:
     run_options: list[dict[str, object]] = []
 
-    def record_run_options(self: ArkCodeApp, **kwargs: object) -> None:
+    async def record_run_options(self: ArkCodeApp, **kwargs: object) -> None:
         run_options.append(kwargs)
 
     write_valid_env(tmp_path / ".env")
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(ArkCodeApp, "run", record_run_options)
+    monkeypatch.setattr(ArkCodeApp, "run_async", record_run_options)
 
     cli.main()
 
@@ -67,10 +72,10 @@ def test_main_redacts_secrets_from_startup_errors(
     )
     monkeypatch.chdir(tmp_path)
 
-    def fail_to_start(self: ArkCodeApp, **kwargs: object) -> None:
+    async def fail_to_start(self: ArkCodeApp, **kwargs: object) -> None:
         raise RuntimeError(f"SDK failed with key {secret}")
 
-    monkeypatch.setattr(ArkCodeApp, "run", fail_to_start)
+    monkeypatch.setattr(ArkCodeApp, "run_async", fail_to_start)
 
     with pytest.raises(SystemExit) as exc_info:
         cli.main()
@@ -79,3 +84,68 @@ def test_main_redacts_secrets_from_startup_errors(
     stderr = capsys.readouterr().err
     assert "ArkCode 启动失败" in stderr
     assert secret not in stderr
+
+
+def test_main_registers_mcp_tools_and_closes_manager(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    observed_names: list[str] = []
+    observed_statuses: list[McpStatus] = []
+
+    class Caller:
+        async def call_tool(
+            self, name: str, arguments: dict[str, Any] | None = None
+        ) -> mtypes.CallToolResult:
+            return mtypes.CallToolResult(content=[])
+
+    remote_tool = McpTool(
+        full_name="mcp__demo__echo",
+        remote_name="echo",
+        tool_description="echo",
+        input_schema={"type": "object"},
+        _read_only=True,
+        caller=Caller(),
+    )
+
+    class FakeManager:
+        def tools(self) -> list[McpTool]:
+            return [remote_tool]
+
+        def status(self) -> McpStatus:
+            return McpStatus(2, 1, 1)
+
+        async def close(self) -> None:
+            events.append("closed")
+
+    class FakeApp:
+        async def run_async(self) -> None:
+            events.append("ran")
+
+    async def fake_new_manager(config: Config, version: str) -> FakeManager:
+        events.append("connected")
+        return FakeManager()
+
+    def fake_new_app(
+        providers: object,
+        version: str,
+        registry: Registry,
+        engine: object,
+        *,
+        mcp_status: McpStatus,
+    ) -> FakeApp:
+        observed_names.extend(item.name for item in registry.definitions())
+        observed_statuses.append(mcp_status)
+        return FakeApp()
+
+    write_valid_env(tmp_path / ".env")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.mcp_client, "load_config", lambda root: Config())
+    monkeypatch.setattr(cli.mcp_client, "new_manager", fake_new_manager)
+    monkeypatch.setattr(cli, "new_app", fake_new_app)
+
+    cli.main()
+
+    assert "mcp__demo__echo" in observed_names
+    assert observed_statuses == [McpStatus(2, 1, 1)]
+    assert events == ["connected", "ran", "closed"]

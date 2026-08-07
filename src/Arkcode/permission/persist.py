@@ -1,5 +1,6 @@
 """永久精确放行规则写入。"""
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,7 +20,8 @@ def _escape_glob(value: str) -> str:
 
 def rule_for(engine: "Engine", call: ToolCall) -> tuple[Rule, str, bool]:
     target, is_file, ok = extract_target(call)
-    if not ok:
+    mcp_tool = re.fullmatch(r"mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+", call.name)
+    if not ok and mcp_tool is None:
         return Rule("", "", True), "", False
     friendly = friendly_name(call.name)
     if is_file:
@@ -33,7 +35,7 @@ def rule_for(engine: "Engine", call: ToolCall) -> tuple[Rule, str, bool]:
             return Rule("", "", True), "", False
     else:
         target = _escape_glob(target)
-    value = f"{friendly}({target})"
+    value = f"{friendly}({target})" if target else friendly
     return Rule(friendly, target, True), value, True
 
 
