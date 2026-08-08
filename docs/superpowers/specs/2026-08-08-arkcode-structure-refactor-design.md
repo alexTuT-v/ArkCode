@@ -76,16 +76,27 @@ src/Arkcode/
 │   └── runtime.py
 ├── commands/
 │   ├── __init__.py
+│   ├── builtins.py
+│   ├── dispatcher.py
 │   ├── models.py
 │   ├── parser.py
 │   ├── ports.py
 │   ├── registry.py
 │   └── handlers/
 │       ├── __init__.py
-│       ├── core.py
-│       ├── conversation.py
-│       ├── workflow.py
-│       └── skills.py
+│       ├── clear.py
+│       ├── compact.py
+│       ├── do.py
+│       ├── exit.py
+│       ├── help.py
+│       ├── memory.py
+│       ├── permission.py
+│       ├── plan.py
+│       ├── resume.py
+│       ├── review.py
+│       ├── session.py
+│       ├── skill.py
+│       └── status.py
 ├── config/
 │   ├── __init__.py
 │   ├── models.py
@@ -249,6 +260,16 @@ tests/
 
 TUI 外观、焦点、快捷键、Provider 选择、审批交互和流式表现保持不变。
 
+### 5.4 Commands
+
+每条内置 slash command 对应 `commands/handlers/` 下的一个模块。每个模块包含该命令的 handler 和 `Command` 声明；`builtins.py` 统一收集和注册内置命令。
+
+`parser.py` 只把输入解析为命令名和参数；`registry.py` 管理命令、alias、覆盖和补全索引；`dispatcher.py` 统一处理 busy 状态、命令类型和异常展示。Handler 不重复实现这些通用规则。
+
+`ports.py` 定义强类型的 `SessionCommands`、`SkillCommands`、`StatusQueries` 和 `CommandUI` Protocol。`CommandContext` 只持有这些明确接口和参数，不包含具体 Textual App，不使用宽泛 `Any`，也不允许 handler 访问 Agent、Writer 或 Registry 的私有字段。
+
+项目和用户 Skill 产生的动态 slash command 不生成 Python 模块。`handlers/skill.py` 提供 handler factory，由 Skill 集成层按现有覆盖、恢复和热重载规则动态注册。
+
 ## 6. 数据流
 
 普通消息：
@@ -274,6 +295,7 @@ ChatInput
 /command
   → commands.parser
   → commands.registry
+  → commands.dispatcher
   → CommandHandler
   → commands.ports.SessionCommands Protocol
   → SessionService
@@ -299,7 +321,7 @@ Conversation、SessionWriter 和 compact boundary 的协调统一位于 SessionS
 3. 拆分 `config`，移动 `llm/providers`。
 4. 迁移 `tools` 与 MCP tool adapter。
 5. 迁移 `context` 与 `conversations`。
-6. 重组 `commands` 并建立 ports。
+6. 重组 `commands`，为每条内置命令建立独立 handler，并建立 dispatcher 和强类型 ports。
 7. 拆分 `agents`。
 8. 建立 application runtime 和 session service。
 9. 拆分 `tui`。
@@ -340,6 +362,7 @@ mypy src/Arkcode
 - 内置工具、Skill 工具的名称、顺序和 JSON Schema
 - Plan Mode 可见工具集合
 - slash command 名称、参数和补全顺序
+- 内置命令的类型、alias、busy 判定和动态 Skill 覆盖/恢复规则
 - Provider 请求中的 system、environment 和 reminder
 - Session JSONL、compact boundary 和 `.Arkcode/` 路径
 - Memory 与 Skill 加载优先级
