@@ -11,7 +11,13 @@ from textual.widgets import OptionList, RichLog, Static, TextArea
 
 import Arkcode.tui.app as app_module
 import Arkcode.tui.view as view_module
-from Arkcode.agent import NOTICE_CANCELLED, NOTICE_STREAM_ERR, ApprovalRequest
+from Arkcode.agent import (
+    NOTICE_CANCELLED,
+    NOTICE_STREAM_ERR,
+    ApprovalRequest,
+    CompactEvent,
+    CompactPhase,
+)
 from Arkcode.config import ProviderConfig
 from Arkcode.llm import (
     Message,
@@ -28,6 +34,7 @@ from Arkcode.llm import (
 from Arkcode.mcp import McpStatus
 from Arkcode.permission import Mode, Outcome, new_engine
 from Arkcode.prompt import EXECUTE_DIRECTIVE, plan_reminder
+from Arkcode.session import Writer
 from Arkcode.tool import Registry, Result, new_default_registry
 from Arkcode.tui.app import ArkCodeApp, MessageInput, SessionState
 from Arkcode.tui.stream import ToolDisplay
@@ -173,6 +180,215 @@ async def wait_until_idle(
         if app.state is SessionState.IDLE:
             return
     pytest.fail("应用未在预期时间内回到 IDLE")
+
+
+class CompactSpyAgent:
+    def __init__(self) -> None:
+        self.force_calls = 0
+        self.run_calls = 0
+
+    async def run_force_compact(
+        self,
+        conversation: object,
+        definitions: object,
+    ) -> tuple[int, int]:
+        self.force_calls += 1
+        return 120000, 42000
+
+    async def run(self, *args: object) -> AsyncIterator[object]:
+        self.run_calls += 1
+        if False:
+            yield None
+
+
+@pytest.mark.asyncio
+async def test_compact_command_does_not_enter_conversation_or_main_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        spy = CompactSpyAgent()
+        app.agent = spy  # type: ignore[assignment]
+
+        await app.submit("/compact")
+
+        assert spy.force_calls == 1
+        assert spy.run_calls == 0
+        assert app.conv.messages() == []
+        assert "已压缩，token 从 120000 降至 42000" in log_text(
+            app.query_one("#log", RichLog)
+        )
+
+
+@pytest.mark.asyncio
+async def test_unknown_slash_command_is_friendly_and_does_not_run_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        spy = CompactSpyAgent()
+        app.agent = spy  # type: ignore[assignment]
+
+        await app.submit("/unknown")
+
+        assert spy.run_calls == 0
+        assert app.conv.messages() == []
+        assert "未知命令: /unknown" in log_text(app.query_one("#log", RichLog))
+
+
+@pytest.mark.asyncio
+async def test_resume_command_restores_selected_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    target = tmp_path / ".Arkcode" / "sessions" / "20260808-120000-abcd"
+    with Writer(str(target)) as writer:
+        writer.append(Message(role="user", content="恢复这段对话"), "old-model", True)
+        writer.append(Message(role="assistant", content="旧回复"), "", False)
+    jsonl = target / "conversation.jsonl"
+    lines = [json.loads(line) for line in jsonl.read_text().splitlines()]
+    for line in lines:
+        line["ts"] = 1
+    jsonl.write_text(
+        "\n".join(json.dumps(line, ensure_ascii=False) for line in lines) + "\n",
+        encoding="utf-8",
+    )
+    runtime = app_module.SessionRuntime(
+        replacement=app_module.ContentReplacementState(),
+        recovery=app_module.RecoveryState(),
+        auto_tracking=app_module.CompactCircuitBreaker(),
+        session=app_module.new_session_context(str(tmp_path)),
+    )
+    active_writer = Writer(runtime.session.session_dir)
+    app = ArkCodeApp(
+        [provider_config()],
+        "0.1.0",
+        new_default_registry(),
+        runtime=runtime,
+        writer=active_writer,
+        sessions_dir=str(tmp_path / ".Arkcode" / "sessions"),
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("/resume")
+        assert app.state is SessionState.RESUMING
+        assert app.query_one("#resume-list", OptionList).display is True
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.state is SessionState.IDLE
+        assert app.runtime.session.session_id == target.name
+        assert app.conv.messages()[:2] == [
+            Message(role="user", content="恢复这段对话"),
+            Message(role="assistant", content="旧回复"),
+        ]
+        assert "本会话已暂停" in app.conv.messages()[-1].content
+        assert f"已恢复会话 {target.name}" in log_text(app.query_one("#log", RichLog))
+        before = len(jsonl.read_text(encoding="utf-8").splitlines())
+        app.conv.add_user("继续旧会话")
+        after = len(jsonl.read_text(encoding="utf-8").splitlines())
+        assert after == before + 1
+
+
+@pytest.mark.asyncio
+async def test_resume_list_supports_navigation_search_and_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    sessions = tmp_path / ".Arkcode" / "sessions"
+    for session_id, title in (
+        ("20260807-120000-aaaa", "alpha topic"),
+        ("20260808-120000-bbbb", "beta topic"),
+    ):
+        with Writer(str(sessions / session_id)) as writer:
+            writer.append(Message(role="user", content=title), "old-model", True)
+    runtime = app_module.SessionRuntime(
+        replacement=app_module.ContentReplacementState(),
+        recovery=app_module.RecoveryState(),
+        auto_tracking=app_module.CompactCircuitBreaker(),
+        session=app_module.new_session_context(str(tmp_path)),
+    )
+    app = ArkCodeApp(
+        [provider_config()],
+        "0.1.0",
+        new_default_registry(),
+        runtime=runtime,
+        writer=Writer(runtime.session.session_dir),
+        sessions_dir=str(sessions),
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        original_id = app.runtime.session.session_id
+        await app.submit("/resume")
+        options = app.query_one("#resume-list", OptionList)
+        assert options.option_count == 2
+        assert "old-model" in app.resume_filtered[0].display_text
+
+        await pilot.press("down")
+        assert options.highlighted == 1
+        await pilot.press("b", "e", "t", "a")
+        assert [item.info.title for item in app.resume_filtered] == ["beta topic"]
+
+        await pilot.press("escape")
+        assert app.state is SessionState.IDLE
+        assert app.runtime.session.session_id == original_id
+
+
+@pytest.mark.asyncio
+async def test_resume_command_is_rejected_while_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    provider = ControlledProvider([TextDelta("done"), end()], release=release)
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await app.submit("long task")
+        await pilot.pause()
+        await app.submit("/resume")
+
+        assert app.state is SessionState.STREAMING
+        assert "请等待当前任务完成" in log_text(app.query_one("#log", RichLog))
+        release.set()
+        await wait_until_idle(pilot, app)
+
+
+def test_compact_notice_formats_auto_emergency_success_and_failure() -> None:
+    from Arkcode.tui.commands import format_compact_notice
+
+    assert (
+        format_compact_notice(CompactEvent(CompactPhase.BEFORE_AUTO))
+        == "正在压缩上下文..."
+    )
+    assert (
+        format_compact_notice(CompactEvent(CompactPhase.BEFORE_EMERGENCY))
+        == "上下文撞墙，自动压缩中..."
+    )
+    assert (
+        format_compact_notice(
+            CompactEvent(CompactPhase.AFTER_AUTO, before=100, after=20)
+        )
+        == "已压缩，token 从 100 降至 20"
+    )
+    assert "压缩失败" in format_compact_notice(
+        CompactEvent(CompactPhase.AFTER_AUTO, err=RuntimeError("boom"))
+    )
 
 
 @pytest.mark.asyncio

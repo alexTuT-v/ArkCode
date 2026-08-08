@@ -6,9 +6,16 @@ from types import SimpleNamespace
 from typing import Any
 
 from Arkcode.config import ProviderConfig
-from Arkcode.llm import Message, Request, StreamEnd, System, TextDelta
-from Arkcode.llm.anthropic_provider import AnthropicProvider
-from Arkcode.llm.openai_provider import OpenAIProvider
+from Arkcode.llm import (
+    Message,
+    PromptTooLongError,
+    Request,
+    StreamEnd,
+    System,
+    TextDelta,
+)
+from Arkcode.llm.anthropic_provider import AnthropicProvider, _wrap_anthropic_error
+from Arkcode.llm.openai_provider import OpenAIProvider, _wrap_openai_error
 from Arkcode.tool import ToolDefinition
 
 
@@ -178,3 +185,24 @@ def test_missing_provider_cache_fields_default_to_zero() -> None:
 
     assert anthropic_events[-1] == StreamEnd("end_turn", 3, 1)
     assert openai_events[-1] == StreamEnd("unknown", 3, 1)
+
+
+def test_provider_context_length_errors_are_wrapped_with_original_cause() -> None:
+    anthropic_error = RuntimeError("prompt is too long")
+    openai_error = RuntimeError("context_length_exceeded")
+    openai_error.code = "context_length_exceeded"  # type: ignore[attr-defined]
+
+    wrapped_anthropic = _wrap_anthropic_error(anthropic_error)
+    wrapped_openai = _wrap_openai_error(openai_error)
+
+    assert isinstance(wrapped_anthropic, PromptTooLongError)
+    assert wrapped_anthropic.__cause__ is anthropic_error
+    assert isinstance(wrapped_openai, PromptTooLongError)
+    assert wrapped_openai.__cause__ is openai_error
+
+
+def test_unrelated_provider_errors_are_not_wrapped() -> None:
+    error = RuntimeError("unauthorized")
+
+    assert _wrap_anthropic_error(error) is error
+    assert _wrap_openai_error(error) is error

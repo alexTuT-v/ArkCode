@@ -112,11 +112,11 @@ When you encounter an obstacle, do not use destructive actions as a shortcut. Tr
     ]
 
 
-def optional_modules() -> list[Module]:
-    """返回尚未接入内容来源的扩展槽位。"""
+def optional_modules(instructions: str = "", memory: str = "") -> list[Module]:
+    """返回项目指令、技能与长期记忆扩展槽位。"""
 
     return [
-        Module("Custom instructions", 80, ""),
+        Module("Custom instructions", 80, instructions),
         Module("Active skills", 90, ""),
-        Module("Long-term memory", 100, ""),
+        Module("Long-term memory", 100, memory),
     ]

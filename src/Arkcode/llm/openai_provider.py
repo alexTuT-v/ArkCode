@@ -13,6 +13,7 @@ from ..config import ProviderConfig
 from ..tool.base import ToolDefinition
 from . import (
     ROLE_TOOL,
+    PromptTooLongError,
     Request,
     StreamEnd,
     StreamError,
@@ -22,6 +23,18 @@ from . import (
     ToolCallDelta,
     ToolCallStart,
 )
+
+
+def _wrap_openai_error(error: Exception) -> Exception:
+    """把 OpenAI 的上下文过长响应映射为统一哨兵。"""
+
+    code = getattr(error, "code", "")
+    details = f"{error} {getattr(error, 'body', '')}".lower()
+    if code != "context_length_exceeded" and "context_length_exceeded" not in details:
+        return error
+    wrapped = PromptTooLongError("openai prompt too long")
+    wrapped.__cause__ = error
+    return wrapped
 
 
 def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
@@ -188,4 +201,4 @@ class OpenAIProvider:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            yield StreamError(exc)
+            yield StreamError(_wrap_openai_error(exc))

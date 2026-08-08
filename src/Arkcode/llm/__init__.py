@@ -1,5 +1,6 @@
 """LLM 协议类型与 Provider 工厂的公共导入门面。"""
 
+from .errors import PromptTooLongError
 from .factory import new_provider
 from .types import (
     ROLE_ASSISTANT,
@@ -29,6 +30,7 @@ __all__ = [
     "ROLE_USER",
     "Message",
     "Provider",
+    "PromptTooLongError",
     "Request",
     "StreamEnd",
     "StreamError",

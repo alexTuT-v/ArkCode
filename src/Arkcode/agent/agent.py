@@ -6,10 +6,24 @@ import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
+from ..compact import (
+    CompactCircuitBreaker,
+    ContentReplacementState,
+    ManageInput,
+    RecoveryState,
+    TriggerKind,
+    manage_context,
+    new_session_context,
+)
+from ..compact.const import AUTO_SAFETY_MARGIN, MANUAL_SAFETY_MARGIN, SUMMARY_RESERVE
+from ..compact.token import estimate_tokens, usage_anchor
 from ..conversation import Conversation
 from ..llm import (
+    Message,
+    PromptTooLongError,
     Provider,
     Request,
     StreamEnd,
@@ -22,10 +36,13 @@ from ..llm import (
     ToolCallComplete,
     ToolResult,
 )
+from ..memory import Manager
 from ..permission import Decision, Engine, Mode, Outcome, new_engine
 from ..prompt import build_system_prompt, gather_environment, plan_reminder
 from ..tool import DEFAULT_TIMEOUT, Registry
 from ..tool.base import ToolDefinition
+from .event import CompactEvent, CompactPhase
+from .runtime import SessionRuntime
 
 MAX_ITERATIONS = 25
 MAX_UNKNOWN_RUN = 3
@@ -90,6 +107,7 @@ class AgentEvent:
     done: bool = False
     err: Exception | None = None
     approval: ApprovalRequest | None = None
+    compact: CompactEvent | None = None
 
 
 @dataclass
@@ -103,6 +121,7 @@ class _StreamState:
     thinking_signature: str = ""
     ended: bool = False
     ok: bool = True
+    error: Exception | None = None
 
     def __post_init__(self) -> None:
         if self.calls is None:
@@ -175,12 +194,52 @@ class Agent:
         registry: Registry,
         version: str = "dev",
         engine: Engine | None = None,
+        *,
+        runtime: SessionRuntime | None = None,
+        memory_manager: Manager | None = None,
+        instruction_text: str = "",
+        memory_text: str = "",
     ) -> None:
         self._provider = provider
         self._registry = registry
         self._version = version
         self._engine = engine or new_engine(os.getcwd())[0]
         self._permissions_enabled = engine is not None
+        self.runtime = runtime or SessionRuntime(
+            replacement=ContentReplacementState(),
+            recovery=RecoveryState(),
+            auto_tracking=CompactCircuitBreaker(),
+            session=new_session_context(os.getcwd()),
+        )
+        self._memory_manager = memory_manager
+        self._instruction_text = instruction_text
+        self._memory_text = memory_text
+        self._run_lock = asyncio.Lock()
+
+    @staticmethod
+    def _recent_turn(messages: list[Message]) -> list[Message]:
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index].role == "user":
+                return messages[index:]
+        return messages
+
+    @staticmethod
+    def _has_memory_signal(messages: list[Message]) -> bool:
+        keywords = ("记住", "记忆", "别忘", "remember", "memo")
+        return any(
+            message.role == "user"
+            and any(keyword in message.content.lower() for keyword in keywords)
+            for message in messages
+        )
+
+    def _schedule_memory_update(self, conv: Conversation) -> None:
+        self.runtime.turn_count += 1
+        manager = self._memory_manager
+        if manager is None:
+            return
+        recent = self._recent_turn(conv.messages())
+        if self.runtime.turn_count % 5 == 0 or self._has_memory_signal(recent):
+            asyncio.create_task(manager.update_async(recent))
 
     def _check_permission(
         self,
@@ -221,7 +280,7 @@ class Agent:
                     break
                 if isinstance(item, StreamError):
                     state.ok = False
-                    yield AgentEvent(err=item.error)
+                    state.error = item.error
                     return
                 if isinstance(item, TextDelta):
                     state.text += item.text
@@ -258,7 +317,7 @@ class Agent:
             raise
         except Exception as exc:
             state.ok = False
-            yield AgentEvent(err=exc)
+            state.error = exc
         finally:
             close = getattr(stream, "aclose", None)
             if close is not None:
@@ -295,6 +354,19 @@ class Agent:
                 call.input,
                 timeout=DEFAULT_TIMEOUT,
             )
+            if call.name == "read_file" and not result.is_error:
+                try:
+                    arguments = json.loads(call.input or "{}")
+                    path_value = arguments.get("path")
+                    if isinstance(path_value, str) and path_value:
+                        absolute = Path(path_value).resolve()
+                        raw = await asyncio.to_thread(absolute.read_bytes)
+                        self.runtime.recovery.record_file(
+                            str(absolute),
+                            raw.decode("utf-8", errors="replace"),
+                        )
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    pass
             state.results[index] = ToolResult(
                 tool_call_id=call.id,
                 content=result.content,
@@ -451,6 +523,34 @@ class Agent:
                 return
             index = end
 
+    def _manage_input(
+        self,
+        conv: Conversation,
+        definitions: list[ToolDefinition],
+        trigger: TriggerKind,
+    ) -> ManageInput:
+        messages = conv.messages()
+        estimated = estimate_tokens(
+            self.runtime.usage_anchor,
+            messages,
+            self.runtime.anchor_msg_len,
+        )
+        return ManageInput(
+            conv=conv,
+            provider=self._provider,
+            model=self._provider.model,
+            context_window=self.runtime.context_window,
+            tool_defs=definitions,
+            replacement=self.runtime.replacement,
+            recovery=self.runtime.recovery,
+            auto_tracking=self.runtime.auto_tracking,
+            session=self.runtime.session,
+            usage_anchor=self.runtime.usage_anchor,
+            anchor_msg_len=self.runtime.anchor_msg_len,
+            estimated_token=estimated,
+            trigger=trigger,
+        )
+
     async def run(
         self,
         conv: Conversation,
@@ -459,18 +559,44 @@ class Agent:
     ) -> AsyncIterator[AgentEvent]:
         """运行一轮完整 ReAct 循环并以事件流持续报告进度。"""
 
-        definitions = (
-            self._registry.read_only_definitions()
-            if mode is Mode.PLAN
-            else self._registry.definitions()
-        )
+        async with self._run_lock:
+            async for event in self._run_unlocked(conv, mode, cancel):
+                yield event
+
+    async def run_force_compact(
+        self,
+        conv: Conversation,
+        tool_defs: list[ToolDefinition],
+    ) -> tuple[int, int]:
+        """与普通 run 串行地无条件执行一次手动摘要。"""
+
+        async with self._run_lock:
+            input_ = self._manage_input(conv, tool_defs, TriggerKind.MANUAL)
+            output = await manage_context(input_)
+            self.runtime.usage_anchor = 0
+            self.runtime.anchor_msg_len = 0
+            return output.before_tokens, output.after_tokens
+
+    async def _run_unlocked(
+        self,
+        conv: Conversation,
+        mode: Mode,
+        cancel: asyncio.Event,
+    ) -> AsyncIterator[AgentEvent]:
+        """在调用方持有 run 锁时执行完整 ReAct 循环。"""
+
         environment = await asyncio.to_thread(
             gather_environment,
             self._version,
             self._provider.model,
         )
+        memory_text = (
+            self._memory_manager.load_index()
+            if self._memory_manager is not None
+            else self._memory_text
+        )
         system = System(
-            stable=build_system_prompt(),
+            stable=build_system_prompt(self._instruction_text, memory_text),
             environment=environment.render(),
         )
 
@@ -480,6 +606,48 @@ class Agent:
             if cancel.is_set():
                 _ensure_assistant_tail(conv, NOTICE_CANCELLED)
                 return
+
+            definitions = (
+                self._registry.read_only_definitions()
+                if mode is Mode.PLAN
+                else self._registry.definitions()
+            )
+            manage_input = self._manage_input(conv, definitions, TriggerKind.AUTO)
+            auto_threshold = (
+                self.runtime.context_window - SUMMARY_RESERVE - AUTO_SAFETY_MARGIN
+            )
+            will_auto_compact = (
+                self.runtime.context_window > SUMMARY_RESERVE + AUTO_SAFETY_MARGIN
+                and manage_input.estimated_token >= auto_threshold
+                and not self.runtime.auto_tracking.tripped()
+            )
+            if will_auto_compact:
+                yield AgentEvent(compact=CompactEvent(phase=CompactPhase.BEFORE_AUTO))
+            try:
+                managed = await manage_context(manage_input)
+            except Exception as manage_error:
+                if will_auto_compact:
+                    yield AgentEvent(
+                        compact=CompactEvent(
+                            phase=CompactPhase.AFTER_AUTO,
+                            before=manage_input.estimated_token,
+                            err=manage_error,
+                        )
+                    )
+                yield AgentEvent(err=manage_error)
+                _ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+                return
+            if managed.compacted:
+                self.runtime.usage_anchor = 0
+                self.runtime.anchor_msg_len = 0
+            if will_auto_compact:
+                yield AgentEvent(
+                    compact=CompactEvent(
+                        phase=CompactPhase.AFTER_AUTO,
+                        before=managed.before_tokens,
+                        after=managed.after_tokens,
+                    )
+                )
 
             stream_state = _StreamState()
             reminder = ""
@@ -499,11 +667,67 @@ class Agent:
             if not stream_state.ok:
                 if cancel.is_set():
                     _ensure_assistant_tail(conv, NOTICE_CANCELLED)
+                    return
+                stream_error = stream_state.error or RuntimeError("provider 请求失败")
+                if isinstance(stream_error, PromptTooLongError):
+                    yield AgentEvent(
+                        compact=CompactEvent(phase=CompactPhase.BEFORE_EMERGENCY)
+                    )
+                    emergency_input = self._manage_input(
+                        conv,
+                        definitions,
+                        TriggerKind.EMERGENCY,
+                    )
+                    try:
+                        emergency = await manage_context(emergency_input)
+                    except Exception as compact_error:
+                        yield AgentEvent(
+                            compact=CompactEvent(
+                                phase=CompactPhase.AFTER_EMERGENCY,
+                                before=emergency_input.estimated_token,
+                                err=compact_error,
+                            )
+                        )
+                        yield AgentEvent(err=compact_error)
+                        _ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+                        return
+                    yield AgentEvent(
+                        compact=CompactEvent(
+                            phase=CompactPhase.AFTER_EMERGENCY,
+                            before=emergency.before_tokens,
+                            after=emergency.after_tokens,
+                        )
+                    )
+                    self.runtime.usage_anchor = 0
+                    self.runtime.anchor_msg_len = 0
+                    if estimate_tokens(0, conv.messages(), 0) >= (
+                        self.runtime.context_window - MANUAL_SAFETY_MARGIN
+                    ):
+                        yield AgentEvent(err=stream_error)
+                        _ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+                        return
+                    stream_state = _StreamState()
+                    async for event in self._stream_once(
+                        conv,
+                        definitions,
+                        system,
+                        reminder,
+                        cancel,
+                        stream_state,
+                    ):
+                        yield event
+                    if not stream_state.ok:
+                        yield AgentEvent(err=stream_state.error or stream_error)
+                        _ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+                        return
                 else:
+                    yield AgentEvent(err=stream_error)
                     _ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
-                return
+                    return
 
             if stream_state.usage is not None:
+                self.runtime.usage_anchor = usage_anchor(stream_state.usage)
+                self.runtime.anchor_msg_len = conv.length()
                 yield AgentEvent(
                     usage=Usage(
                         input=stream_state.usage.input_tokens,
@@ -524,6 +748,7 @@ class Agent:
                     thinking=stream_state.thinking,
                     thinking_signature=stream_state.thinking_signature,
                 )
+                self._schedule_memory_update(conv)
                 yield AgentEvent(done=True)
                 return
 

@@ -12,6 +12,7 @@ from ..tool.base import ToolDefinition
 from . import (
     ROLE_TOOL,
     Message,
+    PromptTooLongError,
     Request,
     StreamEnd,
     StreamError,
@@ -24,6 +25,24 @@ from . import (
     ToolCallDelta,
     ToolCallStart,
 )
+
+
+def _wrap_anthropic_error(error: Exception) -> Exception:
+    """把 Anthropic 的上下文过长响应映射为统一哨兵。"""
+
+    details = " ".join(
+        str(value)
+        for value in (
+            error,
+            getattr(error, "message", ""),
+            getattr(error, "body", ""),
+        )
+    ).lower()
+    if "prompt is too long" not in details and "context_length" not in details:
+        return error
+    wrapped = PromptTooLongError("anthropic prompt too long")
+    wrapped.__cause__ = error
+    return wrapped
 
 
 def _to_anthropic_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
@@ -238,4 +257,4 @@ class AnthropicProvider:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            yield StreamError(exc)
+            yield StreamError(_wrap_anthropic_error(exc))

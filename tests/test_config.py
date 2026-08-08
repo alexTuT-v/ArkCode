@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from Arkcode.config import ConfigError, load
+from Arkcode.config import ConfigError, ProviderConfig, effective_context_window, load
 
 
 @pytest.fixture(autouse=True)
@@ -222,3 +222,34 @@ ARKCODE_CLAUDE_MODEL=claude-test
     provider = load(str(path)).providers[0]
 
     assert "do-not-print-this-secret" not in repr(provider)
+
+
+def test_context_window_loads_from_environment(tmp_path: Path) -> None:
+    path = write_env(
+        tmp_path / ".env",
+        """
+ARKCODE_PROVIDERS=Claude
+ARKCODE_CLAUDE_PROTOCOL=anthropic
+ARKCODE_CLAUDE_API_KEY=secret
+ARKCODE_CLAUDE_MODEL=claude-test
+ARKCODE_CLAUDE_CONTEXT_WINDOW=80000
+""",
+    )
+
+    assert load(str(path)).providers[0].context_window == 80000
+
+
+def test_effective_context_window_uses_override_or_protocol_default() -> None:
+    anthropic = ProviderConfig("a", "anthropic", "secret", "model")
+    openai = ProviderConfig("o", "openai", "secret", "model")
+    overridden = ProviderConfig(
+        "custom",
+        "anthropic",
+        "secret",
+        "model",
+        context_window=80000,
+    )
+
+    assert effective_context_window(anthropic) == 200000
+    assert effective_context_window(openai) == 128000
+    assert effective_context_window(overridden) == 80000

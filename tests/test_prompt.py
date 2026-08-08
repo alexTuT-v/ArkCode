@@ -48,6 +48,13 @@ def test_system_prompt_is_ordered_deterministic_and_reinforces_tools() -> None:
     assert [module.content for module in optional_modules()] == ["", "", ""]
 
 
+def test_system_prompt_injects_instructions_and_memory_in_priority_order() -> None:
+    prompt = build_system_prompt("project rules", "remembered facts")
+
+    assert prompt.index("project rules") < prompt.index("remembered facts")
+    assert build_system_prompt("", "") == build_system_prompt()
+
+
 def test_assemble_system_sorts_extensions_and_skips_empty_slots() -> None:
     result = assemble_system(
         [

@@ -4,6 +4,7 @@ import asyncio
 import os
 import time
 from enum import Enum
+from pathlib import Path
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -14,14 +15,24 @@ from textual.message import Message as TextualMessage
 from textual.timer import Timer
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
-from ..agent import ApprovalRequest
-from ..config import ProviderConfig
+from ..agent import Agent, ApprovalRequest, SessionRuntime
+from ..compact import (
+    CompactCircuitBreaker,
+    ContentReplacementState,
+    RecoveryState,
+    new_session_context,
+)
+from ..config import ProviderConfig, effective_context_window
 from ..conversation import Conversation
 from ..llm import Provider, new_provider
 from ..mcp import McpStatus
+from ..memory import Manager as MemoryManager
 from ..permission import Engine, Mode, Outcome
-from ..prompt import EXECUTE_DIRECTIVE, render_banner
+from ..prompt import render_banner
+from ..session import Writer
 from ..tool import Registry
+from .commands import dispatch_command
+from .resume import SessionItem, begin_resume, do_resume_session, handle_resume_key
 from .select import provider_options
 from .stream import StreamControllerMixin, ToolDisplay
 from .view import (
@@ -42,6 +53,7 @@ class SessionState(Enum):
     IDLE = "idle"
     STREAMING = "streaming"
     APPROVING = "approving"
+    RESUMING = "resuming"
 
 
 def next_mode(mode: Mode) -> Mode:
@@ -86,6 +98,14 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         height: auto;
         max-height: 70%;
         margin: 2 4;
+        border: round $accent;
+    }
+
+    #resume-list {
+        width: 90%;
+        height: auto;
+        max-height: 70%;
+        margin: 1 4;
         border: round $accent;
     }
 
@@ -148,6 +168,12 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         registry: Registry,
         engine: Engine | None = None,
         mcp_status: McpStatus | None = None,
+        runtime: SessionRuntime | None = None,
+        writer: Writer | None = None,
+        mem_mgr: MemoryManager | None = None,
+        instruction_text: str = "",
+        memory_text: str = "",
+        sessions_dir: str | None = None,
     ) -> None:
         super().__init__()
         self.providers = providers
@@ -155,12 +181,34 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         # Textual 的 App 已占用 ``_registry`` 管理 DOM 节点。
         self._tool_registry = registry
         self.engine = engine
+        self.runtime = runtime or SessionRuntime(
+            replacement=ContentReplacementState(),
+            recovery=RecoveryState(),
+            auto_tracking=CompactCircuitBreaker(),
+            session=new_session_context(os.getcwd()),
+        )
+        self.agent: Agent | None = None
+        self._pending_command = ""
         self.mcp_status = mcp_status
         self.state = (
             SessionState.IDLE if len(providers) == 1 else SessionState.SELECTING
         )
         self.provider: Provider | None = None
-        self.conv = Conversation()
+        self.writer = writer or Writer(self.runtime.session.session_dir)
+        self.mem_mgr = mem_mgr
+        self.instruction_text = instruction_text
+        self.memory_text = memory_text
+        self.sessions_dir = sessions_dir or str(
+            Path(self.runtime.session.session_dir).parent
+        )
+        self.conv = Conversation(
+            on_append=self.writer.on_append,
+            on_replace=self.writer.on_replace,
+        )
+        self.resume_list: OptionList
+        self.resume_items: list[SessionItem] = []
+        self.resume_filtered: list[SessionItem] = []
+        self.resume_query = ""
         self.cur_reply = ""
         self.turn_start = 0.0
         self._stream_task: asyncio.Task[None] | None = None
@@ -183,6 +231,7 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
                 *provider_options(self.providers),
                 id="provider-select",
             )
+        yield OptionList(id="resume-list")
         yield RichLog(id="log", wrap=True, markup=True, min_width=1)
         yield Static("", id="streaming")
         with Horizontal(id="input-row"):
@@ -195,6 +244,8 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         yield Static("", id="statusbar")
 
     def on_mount(self) -> None:
+        self.resume_list = self.query_one("#resume-list", OptionList)
+        self.resume_list.display = False
         log = self.query_one("#log", RichLog)
         log.write(render_banner(self._version, os.getcwd()))
         if self.mcp_status is not None:
@@ -205,6 +256,9 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
             self._activate_provider(self.providers[0])
             return
         self._show_selection()
+
+    def on_unmount(self) -> None:
+        self.writer.close()
 
     def _show_selection(self) -> None:
         self.state = SessionState.SELECTING
@@ -221,6 +275,20 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
 
     def _activate_provider(self, config: ProviderConfig) -> None:
         self.provider = new_provider(config)
+        self.writer.set_model(self.provider.model)
+        if self.mem_mgr is not None:
+            self.mem_mgr.set_provider(self.provider, self.provider.model)
+        self.runtime.context_window = effective_context_window(config)
+        self.agent = Agent(
+            self.provider,
+            self._tool_registry,
+            self._version,
+            self.engine,
+            runtime=self.runtime,
+            memory_manager=self.mem_mgr,
+            instruction_text=self.instruction_text,
+            memory_text=self.memory_text,
+        )
         self.state = SessionState.IDLE
         option_list = self.query("#provider-select")
         if option_list:
@@ -237,13 +305,30 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         self._update_statusbar()
         self.query_one("#input", MessageInput).focus()
 
-    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+    async def on_option_list_option_selected(
+        self, event: OptionList.OptionSelected
+    ) -> None:
+        if event.option_list.id == "resume-list":
+            if self.state is SessionState.RESUMING and event.option_index < len(
+                self.resume_filtered
+            ):
+                await do_resume_session(
+                    self,
+                    self.resume_filtered[event.option_index].info,
+                )
+            return
         self._activate_provider(self.providers[event.option_index])
 
     async def on_message_input_submitted(self, event: MessageInput.Submitted) -> None:
         await self.submit(event.text)
 
-    def on_key(self, event: Key) -> None:
+    async def on_key(self, event: Key) -> None:
+        if self.state is SessionState.RESUMING:
+            if event.key in {"escape", "backspace", "enter"} or getattr(
+                event, "character", None
+            ):
+                await handle_resume_key(self, event)
+            return
         if self.state is not SessionState.APPROVING:
             return
         if event.key in {"escape", "ctrl+c"}:
@@ -252,35 +337,40 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         event.stop()
         self.update_approving(event.key)
 
+    def begin_resume(self) -> None:
+        begin_resume(self)
+
     async def submit(self, text: str) -> None:
         """提交一轮用户输入；流式期间忽略新的提交。"""
 
         if self.state is not SessionState.IDLE:
+            if text.strip() == "/resume" and self.state in {
+                SessionState.STREAMING,
+                SessionState.APPROVING,
+            }:
+                self.query_one("#log", RichLog).write(
+                    Text("请等待当前任务完成", style="dim")
+                )
             return
         command = text.strip()
-        if command == "/exit":
-            await self.action_quit()
-            return
         if not command:
             return
 
         input_box = self.query_one("#input", MessageInput)
         input_box.clear()
-        if command == "/plan":
-            self.mode = Mode.PLAN
-            self.query_one("#log", RichLog).write(
-                Text("已进入计划模式（只读工具）", style="dim")
-            )
-            self._update_statusbar()
+        handler, handled = dispatch_command(command)
+        if handled:
+            self._pending_command = command
+            assert handler is not None
+            await handler(self)
             return
 
-        if command == "/do":
-            self.mode = Mode.DEFAULT
-            user_text = EXECUTE_DIRECTIVE
-            self._update_statusbar()
-        else:
-            user_text = text
+        await self._submit_user_text(text)
 
+    async def _submit_user_text(self, user_text: str) -> None:
+        """把普通用户文本写入会话并启动 Agent 消费任务。"""
+
+        input_box = self.query_one("#input", MessageInput)
         self.conv.add_user(user_text)
         self.query_one("#log", RichLog).write(user_block(user_text))
         input_box.disabled = True
@@ -369,9 +459,15 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         if self.state in (SessionState.STREAMING, SessionState.APPROVING):
             self._cancel_active_turn()
             return
+        self.writer.close()
         self.exit()
 
     def action_cancel_turn(self) -> None:
+        if self.state is SessionState.RESUMING:
+            from .resume import cancel_resume
+
+            cancel_resume(self)
+            return
         if self.state in (SessionState.STREAMING, SessionState.APPROVING):
             self._cancel_active_turn()
 
@@ -397,7 +493,25 @@ def new_app(
     registry: Registry,
     engine: Engine,
     mcp_status: McpStatus | None = None,
+    runtime: SessionRuntime | None = None,
+    writer: Writer | None = None,
+    mem_mgr: MemoryManager | None = None,
+    instruction_text: str = "",
+    memory_text: str = "",
+    sessions_dir: str | None = None,
 ) -> ArkCodeApp:
     """构造注入权限引擎的 TUI 应用。"""
 
-    return ArkCodeApp(providers, version, registry, engine, mcp_status)
+    return ArkCodeApp(
+        providers,
+        version,
+        registry,
+        engine,
+        mcp_status,
+        runtime,
+        writer,
+        mem_mgr,
+        instruction_text,
+        memory_text,
+        sessions_dir,
+    )

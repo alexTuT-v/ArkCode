@@ -54,7 +54,7 @@ class Request:
     """一次模型请求所需的协议无关输入。"""
 
     messages: list[Message] = field(default_factory=list)
-    tools: list[ToolDefinition] = field(default_factory=list)
+    tools: list[ToolDefinition] | None = field(default_factory=list)
     system: System = field(default_factory=System)
     reminder: str = ""
 

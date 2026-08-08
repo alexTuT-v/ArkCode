@@ -18,6 +18,8 @@ from .agent import (
     Usage,
     new_agent,
 )
+from .event import CompactEvent, CompactPhase
+from .runtime import SessionRuntime
 
 __all__ = [
     "MAX_ITERATIONS",
@@ -32,7 +34,10 @@ __all__ = [
     "Agent",
     "AgentEvent",
     "ApprovalRequest",
+    "CompactEvent",
+    "CompactPhase",
     "Phase",
+    "SessionRuntime",
     "ToolEvent",
     "Usage",
     "new_agent",

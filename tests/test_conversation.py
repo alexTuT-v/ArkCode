@@ -60,3 +60,66 @@ def test_keeps_tool_calls_and_results_in_protocol_neutral_history() -> None:
     ]
     assert messages[1].tool_calls == [call]
     assert messages[2].tool_results == [result]
+
+
+def test_replace_history_deep_copies_nested_messages() -> None:
+    conversation = Conversation()
+    messages = [Message(role="user", content="original")]
+
+    conversation.replace_history(messages)
+    messages[0] = Message(role="user", content="changed")
+
+    assert conversation.messages() == [Message(role="user", content="original")]
+
+
+def test_replace_history_accepts_none_and_empty_list() -> None:
+    conversation = Conversation()
+    conversation.add_user("old")
+
+    conversation.replace_history(None)
+    assert conversation.length() == 0
+    conversation.add_user("new")
+    conversation.replace_history([])
+    assert conversation.messages() == []
+
+
+def test_append_callback_runs_after_message_is_visible() -> None:
+    observed: list[Message] = []
+    conversation: Conversation
+
+    def on_append(message: Message) -> None:
+        assert conversation.messages()[-1] == message
+        observed.append(message)
+
+    conversation = Conversation(on_append=on_append)
+    conversation.add_user("hello")
+    conversation.add_assistant("world")
+
+    assert observed == conversation.messages()
+
+
+def test_replace_callback_receives_detached_replacement() -> None:
+    observed: list[list[Message]] = []
+    conversation = Conversation(on_replace=observed.append)
+    replacement = [Message(role="user", content="new")]
+
+    conversation.replace_messages(replacement)
+    replacement[0] = Message(role="user", content="changed")
+    observed[0][0] = Message(role="user", content="callback changed")
+
+    assert conversation.messages() == [Message(role="user", content="new")]
+
+
+def test_from_messages_does_not_emit_initial_callbacks() -> None:
+    appended: list[Message] = []
+    replaced: list[list[Message]] = []
+
+    conversation = Conversation.from_messages(
+        [Message(role="user", content="restored")],
+        on_append=appended.append,
+        on_replace=replaced.append,
+    )
+
+    assert conversation.messages() == [Message(role="user", content="restored")]
+    assert appended == []
+    assert replaced == []

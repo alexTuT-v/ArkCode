@@ -133,6 +133,7 @@ def test_main_registers_mcp_tools_and_closes_manager(
         engine: object,
         *,
         mcp_status: McpStatus,
+        **kwargs: object,
     ) -> FakeApp:
         observed_names.extend(item.name for item in registry.definitions())
         observed_statuses.append(mcp_status)

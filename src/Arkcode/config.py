@@ -27,6 +27,7 @@ class ProviderConfig:
     model: str
     base_url: str | None = None
     thinking: bool = False
+    context_window: int = 0
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,15 @@ def _from_environment() -> Config:
         if thinking_text not in {"true", "false"}:
             raise ConfigError(f"{thinking_variable} 必须是 true 或 false")
 
+        context_window_variable = f"{prefix}CONTEXT_WINDOW"
+        context_window_text = os.environ.get(context_window_variable, "0").strip()
+        try:
+            context_window = int(context_window_text or "0")
+        except ValueError as exc:
+            raise ConfigError(f"{context_window_variable} 必须是非负整数") from exc
+        if context_window < 0:
+            raise ConfigError(f"{context_window_variable} 必须是非负整数")
+
         providers.append(
             ProviderConfig(
                 name=name,
@@ -85,10 +95,21 @@ def _from_environment() -> Config:
                 model=_required(f"{prefix}MODEL"),
                 base_url=os.environ.get(f"{prefix}BASE_URL", "").strip() or None,
                 thinking=thinking_text == "true",
+                context_window=context_window,
             )
         )
 
     return Config(providers=providers)
+
+
+def effective_context_window(provider: ProviderConfig) -> int:
+    """返回显式窗口配置，缺省时使用协议的保守默认值。"""
+
+    if provider.context_window > 0:
+        return provider.context_window
+    if provider.protocol == "openai":
+        return 128000
+    return 200000
 
 
 def load(path: str) -> Config:

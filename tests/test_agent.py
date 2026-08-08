@@ -17,12 +17,21 @@ from Arkcode.agent import (
     NOTICE_STREAM_ERR,
     NOTICE_UNKNOWN_TOOLS,
     Agent,
+    CompactPhase,
     Mode,
     Phase,
+)
+from Arkcode.agent.runtime import SessionRuntime
+from Arkcode.compact import (
+    CompactCircuitBreaker,
+    ContentReplacementState,
+    RecoveryState,
+    new_session_context,
 )
 from Arkcode.conversation import Conversation
 from Arkcode.llm import (
     Message,
+    PromptTooLongError,
     Request,
     StreamEnd,
     StreamError,
@@ -92,6 +101,32 @@ class BlockingProvider(FakeProvider):
         yield end()
 
 
+class LongSessionProvider:
+    name = "fake"
+    model = "fake-model"
+
+    def __init__(self) -> None:
+        self.main_calls = 0
+        self.summary_calls = 0
+
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        if req.tools is None:
+            self.summary_calls += 1
+            yield TextDelta("<summary>long session summary</summary>")
+            yield end()
+            return
+        self.main_calls += 1
+        if self.main_calls < MAX_ITERATIONS:
+            yield ToolCallComplete(
+                tool_id=f"large-{self.main_calls}",
+                tool_name="large_read",
+                arguments={},
+            )
+        else:
+            yield TextDelta("long session complete")
+        yield end(self.main_calls * 10000, 20)
+
+
 @dataclass
 class Tracker:
     active: int = 0
@@ -132,6 +167,11 @@ class InstrumentedTool:
                 self.tracker.active -= 1
 
 
+class LargeResultTool(InstrumentedTool):
+    async def execute(self, args: str) -> Result:
+        return Result("x" * 30000)
+
+
 def registry_with(*tools: InstrumentedTool) -> Registry:
     registry = Registry()
     for tool in tools:
@@ -170,6 +210,243 @@ async def collect(
             cancel or asyncio.Event(),
         )
     ]
+
+
+class MemorySpy:
+    def __init__(self) -> None:
+        self.updated: list[list[Message]] = []
+        self.done = asyncio.Event()
+
+    def load_index(self) -> str:
+        return "fresh memory"
+
+    async def update_async(self, messages: list[Message]) -> None:
+        self.updated.append(messages)
+        self.done.set()
+
+
+@pytest.mark.asyncio
+async def test_agent_injects_context_and_schedules_memory_update(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider([[TextDelta("好的"), end()]])
+    session_runtime = runtime(tmp_path)
+    memory = MemorySpy()
+    conversation = Conversation()
+    conversation.add_user("请记住我喜欢简洁回复")
+    agent = Agent(
+        provider,
+        Registry(),
+        runtime=session_runtime,
+        memory_manager=memory,  # type: ignore[arg-type]
+        instruction_text="project instruction",
+        memory_text="old memory",
+    )
+
+    await collect(agent, conversation)
+    await asyncio.wait_for(memory.done.wait(), timeout=1)
+
+    assert session_runtime.turn_count == 1
+    assert memory.updated == [
+        [
+            Message(role="user", content="请记住我喜欢简洁回复"),
+            Message(role="assistant", content="好的"),
+        ]
+    ]
+    stable = provider.requests[0].system.stable
+    assert "project instruction" in stable
+    assert "fresh memory" in stable
+
+
+@pytest.mark.asyncio
+async def test_agent_schedules_memory_update_every_fifth_turn(tmp_path: Path) -> None:
+    provider = FakeProvider([[TextDelta("done"), end()]])
+    session_runtime = runtime(tmp_path)
+    session_runtime.turn_count = 4
+    memory = MemorySpy()
+    conversation = Conversation.from_messages(
+        [Message(role="user", content="普通消息")]
+    )
+
+    await collect(
+        Agent(
+            provider,
+            Registry(),
+            runtime=session_runtime,
+            memory_manager=memory,  # type: ignore[arg-type]
+        ),
+        conversation,
+    )
+    await asyncio.wait_for(memory.done.wait(), timeout=1)
+
+    assert session_runtime.turn_count == 5
+    assert len(memory.updated) == 1
+
+
+def runtime(tmp_path: Path, context_window: int = 200000) -> SessionRuntime:
+    return SessionRuntime(
+        replacement=ContentReplacementState(),
+        recovery=RecoveryState(),
+        auto_tracking=CompactCircuitBreaker(),
+        session=new_session_context(str(tmp_path)),
+        context_window=context_window,
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_replaces_usage_anchor_with_latest_main_stream_usage(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider([[TextDelta("done"), end(100, 20)]])
+    session_runtime = runtime(tmp_path)
+    conversation = Conversation()
+    conversation.add_user("hello")
+
+    await collect(
+        Agent(provider, Registry(), runtime=session_runtime),
+        conversation,
+    )
+
+    assert session_runtime.usage_anchor == 120
+    assert session_runtime.anchor_msg_len == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_emits_auto_compact_events(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        [
+            [TextDelta("<summary>compressed</summary>"), end()],
+            [TextDelta("done"), end(100, 20)],
+        ]
+    )
+    conversation = Conversation()
+    conversation.replace_history(
+        [Message(role="user", content="old" * 30000)]
+        + [Message(role="assistant", content="x" * 7000) for _ in range(5)]
+    )
+
+    events = await collect(
+        Agent(provider, Registry(), runtime=runtime(tmp_path, 60000)),
+        conversation,
+    )
+    compact_events = [event.compact for event in events if event.compact]
+
+    assert [event.phase for event in compact_events] == [
+        CompactPhase.BEFORE_AUTO,
+        CompactPhase.AFTER_AUTO,
+    ]
+    assert compact_events[1].before > compact_events[1].after
+    assert compact_events[1].err is None
+
+
+@pytest.mark.asyncio
+async def test_agent_emergency_compacts_and_retries_main_request_once(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider(
+        [
+            [StreamError(PromptTooLongError("too long"))],
+            [TextDelta("<summary>recovered</summary>"), end()],
+            [TextDelta("done"), end()],
+        ]
+    )
+    conversation = Conversation()
+    conversation.add_user("hello")
+
+    events = await collect(
+        Agent(provider, Registry(), runtime=runtime(tmp_path)),
+        conversation,
+    )
+    compact_events = [event.compact for event in events if event.compact]
+
+    assert [event.phase for event in compact_events] == [
+        CompactPhase.BEFORE_EMERGENCY,
+        CompactPhase.AFTER_EMERGENCY,
+    ]
+    assert events[-1].done is True
+    assert provider.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_agent_does_not_emergency_compact_twice_after_retry_ptl(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider(
+        [
+            [StreamError(PromptTooLongError("first"))],
+            [TextDelta("<summary>recovered</summary>"), end()],
+            [StreamError(PromptTooLongError("second"))],
+        ]
+    )
+    conversation = Conversation()
+    conversation.add_user("hello")
+
+    events = await collect(
+        Agent(provider, Registry(), runtime=runtime(tmp_path)),
+        conversation,
+    )
+
+    assert provider.call_count == 3
+    assert sum(event.compact is not None for event in events) == 2
+    assert isinstance(
+        [event.err for event in events if event.err][-1], PromptTooLongError
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_records_clean_read_file_content_before_next_iteration(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "sample.txt"
+    path.write_text("line one\nline two", encoding="utf-8")
+    tool_call = ToolCall(
+        id="read-1",
+        name="read_file",
+        input=json.dumps({"path": str(path)}),
+    )
+    provider = FakeProvider(
+        [
+            [complete(tool_call), end()],
+            [TextDelta("done"), end()],
+        ]
+    )
+    session_runtime = runtime(tmp_path)
+    registry = Registry()
+    from Arkcode.tool.read_file import ReadFileTool
+
+    registry.register(ReadFileTool())
+    conversation = Conversation()
+    conversation.add_user("read")
+
+    await collect(
+        Agent(provider, registry, runtime=session_runtime),
+        conversation,
+    )
+
+    record = session_runtime.recovery.snapshot()[0]
+    assert record.path == str(path)
+    assert record.content == "line one\nline two"
+
+
+@pytest.mark.asyncio
+async def test_long_agent_session_auto_compacts_and_reaches_final_response(
+    tmp_path: Path,
+) -> None:
+    provider = LongSessionProvider()
+    registry = registry_with(LargeResultTool("large_read", True))
+    conversation = Conversation()
+    conversation.add_user("work for many iterations")
+
+    events = await collect(
+        Agent(provider, registry, runtime=runtime(tmp_path, 50000)),
+        conversation,
+    )
+
+    assert provider.main_calls == MAX_ITERATIONS
+    assert provider.summary_calls >= 1
+    assert events[-1].done is True
+    assert conversation.messages()[-1].content == "long session complete"
+    assert conversation.length() < 50
 
 
 @pytest.mark.asyncio

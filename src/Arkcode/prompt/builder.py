@@ -13,7 +13,7 @@ def assemble_system(modules: list[Module]) -> str:
     )
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(instructions: str = "", memory: str = "") -> str:
     """构造跨轮逐字节稳定的系统提示。"""
 
-    return assemble_system(fixed_modules() + optional_modules())
+    return assemble_system(fixed_modules() + optional_modules(instructions, memory))

@@ -14,6 +14,7 @@ from ..conversation import Conversation
 from ..llm import Provider
 from ..permission import Engine, Mode, Outcome
 from ..tool import Registry
+from .commands import format_compact_notice
 from .view import render_markdown, tool_line, tool_result_summary
 
 
@@ -44,6 +45,7 @@ class StreamControllerMixin:
     _version: str
     engine: Engine | None
     pending: ApprovalRequest | None
+    agent: Agent | None
     approve_cursor: int
     state: Any
 
@@ -76,17 +78,21 @@ class StreamControllerMixin:
 
         pending_error: Exception | None = None
         try:
-            agent = Agent(
-                provider,
-                self._tool_registry,
-                self._version,
-                self.engine,
-            )
+            agent = self.agent
+            if agent is None:
+                self._finish_with_error(RuntimeError("Agent 尚未初始化"))
+                return
             cancel = self.turn_cancel
             if cancel is None:
                 self._finish_with_error(RuntimeError("本轮取消事件未初始化"))
                 return
             async for event in agent.run(self.conv, self.mode, cancel):
+                if event.compact is not None:
+                    cast(Any, self).query_one("#log", RichLog).write(
+                        Text(format_compact_notice(event.compact), style="dim")
+                    )
+                    await self._wait_for_streaming_refresh()
+                    continue
                 if event.approval is not None:
                     self.pending = event.approval
                     self.approve_cursor = 0
