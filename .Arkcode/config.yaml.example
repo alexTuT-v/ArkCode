@@ -1,0 +1,7 @@
+# ArkCode 的 Provider 配置位于项目根目录 .env，参见 .env.example。
+# 项目指令按以下优先级拼接：
+#   1. ./ArkCODE.md
+#   2. ./.Arkcode/ArkCODE.md
+#   3. ~/.Arkcode/ArkCODE.md
+# .Arkcode/memory/ 保存项目级长期记忆及 MEMORY.md 索引。
+# .Arkcode/sessions/ 保存 JSONL 会话、压缩边界和工具结果，可通过 /resume 恢复。

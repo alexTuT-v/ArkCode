@@ -11,6 +11,8 @@ from Arkcode.prompt import build_system_prompt
 from Arkcode.prompt.builder import (
     build_system_prompt as build_system_prompt_implementation,
 )
+from Arkcode.skills import SkillExecutor, SkillLoader, SkillMeta, SkillSource
+from Arkcode.tool import InstallSkillTool, LoadSkillTool
 
 
 def test_package_facades_reexport_implementations() -> None:
@@ -20,3 +22,19 @@ def test_package_facades_reexport_implementations() -> None:
     assert new_provider is new_provider_implementation
     assert Engine is EngineImplementation
     assert build_system_prompt is build_system_prompt_implementation
+
+
+def test_skill_public_facades_use_skill_meta_as_the_only_metadata_name() -> None:
+    import Arkcode.command as command_facade
+    import Arkcode.skills as skills_facade
+    import Arkcode.tool as tool_facade
+
+    assert SkillMeta.__name__ == "SkillMeta"
+    assert SkillLoader.__name__ == "SkillLoader"
+    assert SkillExecutor.__name__ == "SkillExecutor"
+    assert SkillSource.__name__ == "SkillSource"
+    assert LoadSkillTool.__name__ == "LoadSkillTool"
+    assert InstallSkillTool.__name__ == "InstallSkillTool"
+    assert not hasattr(skills_facade, "Skill" + "Def")
+    assert hasattr(command_facade, "register_skill_commands")
+    assert hasattr(tool_facade, "InstallSkillTool")

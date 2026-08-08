@@ -6,7 +6,7 @@ from .ui import UI
 
 
 def make_help_handler(registry: Registry) -> Handler:
-    async def handle_help(ui: UI) -> None:
+    async def handle_help(ui: UI, args: str) -> None:
         commands = registry.visible()
         width = max((len(command.name) for command in commands), default=0)
         ui.println(
@@ -19,7 +19,7 @@ def make_help_handler(registry: Registry) -> Handler:
     return handle_help
 
 
-async def handle_status(ui: UI) -> None:
+async def handle_status(ui: UI, args: str) -> None:
     rows = (
         ("Mode:", str(ui.mode())),
         ("Tokens:", f"{ui.usage_in()} in / {ui.usage_out()} out"),
@@ -33,14 +33,14 @@ async def handle_status(ui: UI) -> None:
     ui.println("ArkCode Status\n\n" + rendered)
 
 
-async def handle_memory(ui: UI) -> None:
+async def handle_memory(ui: UI, args: str) -> None:
     files = ui.memory_files()
     ui.println("\n".join(files) if files else "无已加载的记忆文件")
 
 
-async def handle_permission(ui: UI) -> None:
+async def handle_permission(ui: UI, args: str) -> None:
     ui.println(str(ui.mode()))
 
 
-async def handle_session(ui: UI) -> None:
+async def handle_session(ui: UI, args: str) -> None:
     ui.println(f"Session: {ui.session_id()}\nPath: {ui.session_path()}")

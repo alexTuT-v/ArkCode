@@ -1,160 +1,85 @@
-# 多协议 LLM 终端对话客户端 Spec
+# Skill 系统 Spec
 
-## 背景
-Arkcode 是一个从零构建的、Claude Code 风格的终端 AI Agent。本项目是其第一块基石：
-在没有工具调用、权限、记忆等高级能力之前，先打通"人 ↔ LLM"的最小闭环——
-让用户能在终端里与大模型进行流畅的多轮对话。
+## 1. 背景
 
+ArkCode 用户会反复输入一组类似的 prompt（commit message 规范、代码审查清单、跑测试的项目类型识别）。当前所有 prompt 要么写死在源码 Slash Command（`/review`）里，要么用户每次手敲，两个痛点：(1) 不能复用与分发，(2) 长流程任务缺少上下文隔离，中间状态会污染主对话。Skill 把可复用 SOP 装进可编辑的 Markdown 文件，配渐进式披露与执行模式，同时解决这两个问题。
 
-## 目标
-- 打通 LLM API 调用：能向大模型发起请求并正确接收回复。
-- 同时支持 Anthropic 与 OpenAI 两种协议，通过一份配置切换接入对象（含兼容端点）。
-- 提供一个全功能终端界面（TUI），承载输入、流式输出与多轮对话。
-- 回复以流式方式实时呈现，结束后以 markdown 形式美化展示。
-- 在单次会话内维护完整对话上下文，支持连续多轮交流。
-- 对调用失败有可恢复的错误反馈，不中断会话。
+## 2. 目标
 
-## 功能需求
+把 `SKILL.md` 升级为「带 frontmatter + 资源」的能力包。启动时只把 `name + description` 注入对话给 Agent 看；Agent 通过 `LoadSkill` 工具按需把完整 SOP 钉到环境上下文。`inline` 模式 SOP 在主对话内执行，`fork` 模式独立子 Agent 隔离执行后把结果回流。`/` 显式触发与意图识别自动触发共用同一套执行器。
 
-- F1: 配置加载
-  从项目根目录 `.env` 读取多 provider 配置。`ARKCODE_PROVIDERS` 以逗号分隔并显式指定
-  provider 名称及顺序；每个 provider 使用 `ARKCODE_<NAME>_` 前缀配置协议类型、可选的
-  自定义端点地址、密钥、模型名、是否开启扩展思考。`.env` 中的值覆盖同名系统环境变量。
-  逐项校验必要项（如密钥），缺失或非法时给出清晰的启动期错误并终止。
+## 3. 功能需求
 
-- F2: provider 选择
-  若配置中仅有一个 provider，直接采用它进入对话；若有多个，启动后先呈现一个选择
-  界面（方向键列表，列出各 provider 的名称与模型），用户选定一项后再进入对话。
-  被选定者即本次会话的活动 provider。
+### 解析与加载
+- F1: `SkillMeta`（`src/Arkcode/skills/parser.py`）字段：`name / description / prompt_body / mode / model / context / source_path / is_directory`；`mode` 取 `inline | fork`（默认 `inline`），`context` 取 `full | recent | none`（默认 `full`，仅 fork 模式生效）
+- F2: 单文件 `*.md`（YAML frontmatter + body）与目录型（`/SKILL.md` + `references/*.py`）两种磁盘布局；`SkillLoader._scan_directory` 区分两类
+- F3: 两级搜索路径加载（`src/Arkcode/skills/loader.py`），优先级 `项目 .Arkcode/skills/` > `~/.Arkcode/skills/`；首次出现的 name 占位，后续同名跳过；解析失败单条 `warning` 日志并跳过
+- F4: 启动期 `SkillLoader.load_all` 解析所有 frontmatter+body 进内存；`SkillLoader.get(name)` 每次重读源文件实现热重载，失败回退缓存（`src/Arkcode/skills/loader.py`）
 
-- F3: 多协议适配
-  根据活动 provider 的"协议类型"选择对应的请求构造与响应解析方式，统一支持
-  Anthropic 与 OpenAI 两种协议。若配置了自定义端点地址，则覆盖该协议的默认端点
-  （从而可接入各类兼容服务）。对上层暴露与协议无关的统一对话接口。
+### 执行
+- F5: `substitute_arguments(prompt_body, args)`（`src/Arkcode/skills/parser.py`）把 `$ARGUMENTS` 替换为参数；没有占位符则原样返回
+- F6: inline 执行：`SkillExecutor.execute_inline`（`src/Arkcode/skills/executor.py`）渲染 body 后调用 `Agent.activate_skill(name, body)` 钉到 env context，主循环每轮迭代重建 environment 时 SOP 都注入
+- F7: fork 执行：`SkillExecutor.execute_fork`（`src/Arkcode/skills/executor.py`）创建独立 `Conversation` 与 `SessionRuntime`，按 `context` 字段决定历史携带（`full` = 摘要 / `recent` = 最近 5 条 / `none` = 完全隔离），累计 `AgentEvent.text` 到 `done=True` 后回流
 
-- F4: 发起对话请求
-  将"内置系统提示词 + 当前完整对话历史"作为上下文，向活动 provider 发起一次对话
-  请求，并按配置决定是否开启扩展思考。
+### LoadSkill 工具与 Skill Catalog 注入
+- F10: `LoadSkill`（`src/Arkcode/tool/load_skill.py`）read-only 工具，输入 `{name: str}`；调用 `SkillLoader.get` 取 skill → `Agent.activate_skill` 钉 SOP → 返回简短确认（不返回完整 SOP，避免 tool_result 占用空间）
+- F11: 启动期由 `src/Arkcode/prompt/builder.py` 构建「Available Skills」段（只含 name/description 与 LoadSkill 指引），通过 `Agent.set_skill_catalog` 注入 environment context
 
-- F5: 流式接收
-  以流式方式接收回复，实时解析出正文文本增量并向界面输送。对扩展思考产生的思考
-  增量正确识别但不渲染（接收即丢弃），不得混入正文。
+### 命令集成
+- F12: 每个 skill 由 `register_skill_commands`（`src/Arkcode/command/skills.py`）注册为 `/` 短命令，描述末尾标注 `[skill]`；mode 字段决定运行时分支：inline 调 `execute_inline` 后再发送一次 user message 触发 loop，fork 则创建受 App 跟踪的后台任务并把结果作为 `<system-reminder>` 插入
+- F13: `/skill list | info <name> | reload` 管理子命令（`src/Arkcode/command/skills.py`）：list 列出已加载 skill 与来源；info 显示规范化 frontmatter 与文件路径；reload 重新扫描两级目录并重新注册命令
+- F14: skill 命令与已有 slash 命令同名时，skill 版本优先覆盖旧 handler
 
-- F6: 多轮上下文
-  在单次会话内维护完整对话历史（用户与助手消息交替追加）。每一轮新请求都携带此前
-  全部上下文，实现连续多轮对话。程序退出后历史不保留。
+### 热更新与清理
+- F17: `SkillLoader.get(name)` 每次调用都 `parse_skill_file(source_path)` 重读，文件修改即时生效；解析失败回退 `_cache` 中的旧版本并记 warning（`src/Arkcode/skills/loader.py`）
+- F18: `/clear` 命令成功创建新会话后通过 `src/Arkcode/tui/commands.py` 调 `Agent.clear_active_skills()`，把激活 skill 列表清空
 
-- F7: 终端界面布局
-  启动后进入标准全屏终端界面（使用独立屏幕缓冲区，不在 shell 光标下方以内联方式
-  绘制），自上而下包含：
-  (a) 启动横幅：ASCII 猫咪图案 + 应用名与版本号 + 当前工作目录；
-  (b) 一行就绪提示信息（取代参考图中与 MCP/工具相关的状态行）；
-  (c) 对话区：依时间顺序展示历次用户输入与助手回复；
-  (d) 底部带边框的输入框，含 ❯ 提示符与占位文字（如 "Send a message..."）；
-  (e) 底部状态栏：左侧显示活动 provider 的名称，右侧显示其模型名。
+### 远程安装
+- F19: `InstallSkillTool` 让用户把 URL 发给 Arkcode、由 Agent 自动安装到 `~/.Arkcode/skills/<name>/`
+  - 支持三种 URL：`skills.sh` / `github.com tree` / `raw.githubusercontent.com`
+  - 走 GitHub Contents API 递归拉取目录树（无需本地 git），单文件 ≤1 MiB、总大小 ≤8 MiB、文件数 ≤64、深度 ≤4
+  - 暂存到兄弟 tempdir，验证含 SKILL.md 后 atomic rename 到位
+  - 安装后自动 reload catalog + 重新注册斜杠命令，无需重启即可使用
 
-- F8: 流式呈现与渲染
-  助手回复在流式期间以纯文本逐字实时显示；该轮回复结束后，将其整段以 markdown
-  形式重新渲染美化（代码块、列表、强调等）后定型展示。
+### 来源标识
+- F20: `SkillLoader.get_source_label`（`src/Arkcode/skills/loader.py`）按路径前缀返回 `project | user`
 
-- F9: 输入与提交
-  用户在输入框键入文本，可用 Alt+Enter 插入换行进行多行编辑；按 Enter 提交。提交后
-  清空输入框，界面进入等待/流式状态，期间不接受新的提交，直至本轮回复结束。
+## 4. 非功能需求
 
-- F10: 退出
-  提供明确的退出方式：输入 /exit 命令，或按 Ctrl+C，均可安全退出程序。
+- N1: 单个 skill 文件解析失败不能阻断其他 skill 加载，错误走 `logging.warning`
+- N2: `LoadSkill` 工具调用不弹权限提示（read-only 类别）
+- N3: fork 模式必须隔离 `Conversation` 与 `SessionRuntime`，主对话状态不被子 Agent 修改
+- N5: 项目级与用户级同名 skill 冲突时，项目级优先
 
-- F11: 错误反馈
-  当请求失败（鉴权失败、限流、网络中断、模型不存在等）时，在对话区以可区分的样式
-  展示错误信息，程序不退出，用户可继续下一轮对话。
+## 5. 设计概要
 
-- F12: 响应计时
-  自请求发出（开始等待模型）即启动计时，以"进行中"指示实时显示已用秒数
-  （形如 "Imagining… (5s)"，秒数随时间递增）；收到首个增量后继续计时；本轮回复
-  结束后定型显示该轮总耗时。
+### 核心数据结构
+- `SkillMeta`（`src/Arkcode/skills/parser.py`）：dataclass，含 `mode / model / context` 三个执行字段 + `source_path / is_directory` 元信息
+- `SkillLoader`（`src/Arkcode/skills/loader.py`）：name → `SkillMeta`；持有 `_skills` 与 `_cache` 两份字典，热更新失败回退缓存
+- `SkillExecutor`（`src/Arkcode/skills/executor.py`）：`execute_inline(skill, args) -> None` 与 `execute_fork(skill, args) -> str`
+- `LoadSkillTool`（`src/Arkcode/tool/load_skill.py`）：实现 `Tool` 抽象类；持有 `SkillLoader` 与 `Agent` 引用
+- Agent 新增字段与方法：`active_skills: dict[str, str]`、`_skill_catalog: str`、`activate_skill(name, body)`、`clear_active_skills()`、`set_skill_catalog(catalog)`（`src/Arkcode/agent/agent.py`）
 
-## 非功能需求
+### 主流程
+1. 启动：`ArkCodeApp.__init__` → `SkillLoader(workspace).load_all()` → 注册 `LoadSkillTool/InstallSkillTool` → 构造 `Agent` → 注入 LoadSkill Agent → 构造 `SkillExecutor` → 写入 Catalog → 注册动态命令
+2. system prompt 注入：`src/Arkcode/agent/agent.py` 每轮迭代重建 environment block，把 Catalog 与 Active Skills 渲染结果拼入动态环境段
+3. 稳定 system 仍由 `src/Arkcode/prompt/builder.py` 构建；动态 SOP 不进入稳定缓存块
+4. 显式调用（以 inline skill 为例，如用户自建的 `/commit`）：`register_skill_commands` 注册的 handler → `executor.execute_inline(skill, args)` → `agent.activate_skill(name, rendered_body)` → 再 `ctx.ui.send_user_message(trigger)` 触发 Agent loop
+5. 意图识别：Agent 调 `LoadSkill({name: ""})` → `loader.get` → `agent.activate_skill` → 返回 `"Skill '' activated. SOP pinned to environment context."`
+6. fork 调用（以 fork skill 为例，如用户自建的 `/review`）：handler 创建受 App 跟踪的 task → `executor.execute_fork` 新 Conversation/Runtime + 临时 Agent + 累计 `AgentEvent.text` 到 done → 把最终文本包装为 `<system-reminder>` 插入主对话
+7. `/clear`：handler → reset conversation → `agent.clear_active_skills()` → 后续轮 environment 不再注入旧 SOP
 
-- N1: 界面不阻塞
-  网络请求与界面渲染互不阻塞。流式数据以异步方式驱动界面更新，等待与流式期间界面
-  始终保持响应（可滚动、可见进行中指示），不得冻结。
+### 调用链
+- 启动：`src/Arkcode/tui/app.py` 的 `ArkCodeApp.__init__` → `SkillLoader.load_all` → Provider 激活后 `register_skill_commands`
+- inline 显式（例如 `/commit`）：用户输入 skill 命令 → command handler → `executor.execute_inline` → `agent.activate_skill` → `ctx.ui.send_user_message` → Agent loop（每轮 env 注入 SOP）
+- fork 显式（例如 `/review`）：用户输入 skill 命令 → handler → `asyncio.create_task(execute_fork)` → `system message`
+- 意图触发：Agent 在某轮调用 `LoadSkill` → `loader.get` → `agent.activate_skill` → 下一轮 SOP 钉在 env 里
+- 清理：用户 `/clear` → `handle_clear` → conversation reset + `agent.clear_active_skills`
 
-- N2: 流式实时性与等待反馈
-  在收到首个文本增量前，显示带动画与实时秒数的"处理中"指示（如 "Imagining… (5s)"），
-  让用户明确知道正在等待模型；文本增量到达后尽快逐字呈现，给用户"实时打字"的观感。
+### 与其他模块的交互
+- 上行依赖：`src/Arkcode/tui/app.py`（组装 Loader、Tool、Executor 与命令）、`Agent`（`active_skills` + env 注入）、`Conversation`/`SessionRuntime`（fork 独立实例）
+- 下行：`SkillExecutor` 使用当前 `Arkcode.agent.Agent`、`Arkcode.conversation.Conversation` 与 `Arkcode.tool.Registry` 公共协议
 
-- N3: 跨协议一致体验
-  无论使用 Anthropic 还是 OpenAI 协议，用户感知的输入、流式输出、多轮上下文与错误
-  反馈行为保持一致。
+## 7. 完成定义
 
-- N4: 配置健壮性
-  `.env` 缺失、provider 列表为空、名称非法或重复、必要字段缺失、协议/thinking 值
-  非法等情况，给出明确可读且不含密钥的错误提示，而非崩溃堆栈。
-
-- N5: 密钥安全
-  API 密钥不在界面回显，不打印到对话区或任何日志输出中。
-
-- N6: 终端兼容与自适应
-  在常见终端下正常显示；markdown 渲染与界面布局对终端宽度自适应。至少在 80×24
-  终端中，banner 与会话内容可见，输入框、❯ 提示符和状态栏互不重叠，提示符与输入
-  文字处于同一基线。
-
-- N7: 退出整洁
-  退出时恢复终端状态（清理 raw mode 等），不残留损坏的终端环境。
-
-## 不做的事
-
-- 工具调用 / function calling：本期不发送工具定义、不处理工具调用，纯文本对话。
-- MCP 集成：不连接任何 MCP server（参考图中那行状态仅作视觉参考，不实现）。
-- 权限系统：无任何需授权的操作，故不做权限确认。
-- 上下文压缩：历史增长不做摘要/截断，超长由用户自行控制（留给后续章节）。
-- 长期记忆 / 跨会话记忆：不做。
-- 会话持久化：历史不落盘、不支持重启恢复或续聊。
-- slash 命令体系：除 /exit 外，不做可扩展的命令系统（如 /help、/clear、/model 等）。
-- 运行时切换 provider / model：多份配置仅在启动时选一次，会话中途不切换。
-- inline / shell scrollback 模式：本期采用标准全屏 TUI；退出后不把会话内容保留在
-  shell 终端历史中，历史仅在应用运行期间通过对话区滚动查看。
-- thinking 内容展示：扩展思考增量接收即丢弃，不渲染、不折叠展示。
-- 流式中断：本期不支持取消正在进行的回复。
-- 自动重试 / 限流退避：出错仅提示，不自动重试。
-- 其它配置来源：仅读取项目根目录 `.env` 并覆盖进程内同名环境变量；不兼容旧 YAML，
-  不做 YAML 回退、自动迁移或命令行 flag 覆盖。
-- 用量统计：不显示 token 数与费用（但保留响应耗时计时，见 F12）。
-- 多模态：不支持图片等非文本输入。
-
-## 验收标准
-
-- AC1: (F1) `.env` 中仅配置一份 provider 时，启动直接进入对话；缺少密钥等必要项时，
-  启动给出不含密钥的清晰错误并退出，而非崩溃堆栈。
-- AC2: (F2) 多份 provider 配置时，启动后出现方向键列表供选择；选定后进入对话，底部
-  状态栏显示所选 provider 的名称与模型。
-- AC3: (F3) 同一组对话分别用 anthropic 协议与 openai 协议（含自定义 base_url）配置
-  运行，均能正常收发；切换配置不改变上层交互行为。
-- AC4: (F4) 发出的请求包含内置 system prompt 与完整历史；当配置 thinking 为真时，请求
-  按该协议正确开启扩展思考。
-- AC5: (F5) 回复以逐字流式出现；开启 thinking 时，界面不出现任何思考文本，仅显示最终
-  回复。
-- AC6: (F6) 连续多轮对话中模型能引用前文（如先告知信息、后追问，回答正确），证明
-  上下文被携带；退出再启动后历史为空。
-- AC7: (F7) 启动后进入独立的全屏 TUI，界面包含：猫咪 banner + 应用名与版本 + 工作
-  目录 + 就绪提示行 + 带 ❯ 与占位符的输入框 + 底部状态栏（左侧 provider 名、右侧
-  模型名）；不得与启动前的 shell 内容重叠。
-- AC8: (F8) 回复结束后整段以 markdown 美化显示，代码块、列表、强调等正确渲染。
-- AC9: (F9) 输入框可用 Alt+Enter 换行编辑多行内容，Enter 提交，提交后输入框清空。
-- AC10: (F10) 输入 /exit 或按 Ctrl+C 均能安全退出，退出后终端恢复正常（无残留
-  raw mode / 错乱）。
-- AC11: (F11) 用错误密钥或不存在的模型触发失败时，错误在对话区以可区分样式显示，
-  程序不退出，用户可继续下一轮。
-- AC12: (F12) 从发出请求即开始计时并实时显示秒数（如 "Imagining… (5s)"），首个增量
-  到达前即可见；本轮结束后显示总耗时。
-- AC13: (N1) 等待与流式期间，界面保持可响应（可滚动、不冻结）。
-- AC14: (F1/N4) `ARKCODE_PROVIDERS=deepseek,openai` 时按该顺序解析
-  `ARKCODE_DEEPSEEK_*` 与 `ARKCODE_OPENAI_*`，provider 名称忽略首尾空格、查找前缀时
-  转为大写；名称仅允许字母、数字和下划线且不可重复。
-- AC15: (F1) `.env` 中的值覆盖同名系统环境变量；空 `BASE_URL` 等同未配置；
-  `THINKING` 缺省为 `false` 且仅接受 `true` / `false`。
-- AC16: (N4/N5) `.env` 被 git 忽略，仓库提供不含真实密钥的 `.env.example`；
-  配置对象表示、错误信息、界面和日志均不得泄露 API 密钥。
-- AC17: (F7/N6) 在 80×24 终端启动时，banner 和后续用户/助手消息处于可视对话区；
-  `❯` 与输入占位文字处于同一行，输入区与状态栏无重叠；退出后恢复原 shell 画面和
-  终端输入状态。
+见 [checklist.md](checklist.md)，所有条目勾上即完成。

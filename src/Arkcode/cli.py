@@ -71,6 +71,7 @@ async def _amain() -> int:
             instruction_text=instruction_text,
             memory_text=memory_text,
             sessions_dir=sessions_dir,
+            workspace=root,
         )
         await app.run_async()
     finally:

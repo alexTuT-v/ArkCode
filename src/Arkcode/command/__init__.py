@@ -4,6 +4,7 @@ from .builtins import register_builtins
 from .command import Command, Handler, Kind
 from .dispatch import parse
 from .registry import Registry
+from .skills import register_skill_commands, register_skill_management
 from .ui import UI, NopUI
 
 __all__ = [
@@ -15,4 +16,6 @@ __all__ = [
     "UI",
     "parse",
     "register_builtins",
+    "register_skill_commands",
+    "register_skill_management",
 ]

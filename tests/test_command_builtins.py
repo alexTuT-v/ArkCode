@@ -75,8 +75,8 @@ async def test_help_and_status_render_from_ui_queries() -> None:
     registry = builtins()
     ui = RecordingUI()
 
-    await registry.lookup("help").handler(ui)  # type: ignore[union-attr]
-    await registry.lookup("status").handler(ui)  # type: ignore[union-attr]
+    await registry.lookup("help").handler(ui, "ignored")  # type: ignore[union-attr]
+    await registry.lookup("status").handler(ui, "ignored")  # type: ignore[union-attr]
 
     assert (
         sum(
@@ -115,10 +115,10 @@ async def test_help_and_status_render_from_ui_queries() -> None:
 async def test_prompt_and_busy_ui_commands_follow_kind_contract() -> None:
     registry = builtins()
     ui = RecordingUI()
-    await registry.lookup("do").handler(ui)  # type: ignore[union-attr]
-    await registry.lookup("review").handler(ui)  # type: ignore[union-attr]
+    await registry.lookup("do").handler(ui, "")  # type: ignore[union-attr]
+    await registry.lookup("review").handler(ui, "")  # type: ignore[union-attr]
     ui.busy = True
-    await registry.lookup("compact").handler(ui)  # type: ignore[union-attr]
+    await registry.lookup("compact").handler(ui, "")  # type: ignore[union-attr]
 
     assert ui.modes == [Mode.DEFAULT]
     assert ui.injected[0][0] == "/do"
@@ -135,7 +135,7 @@ async def test_local_detail_commands_render_observable_values() -> None:
     for name in ("memory", "permission", "session"):
         command = registry.lookup(name)
         assert command is not None
-        await command.handler(ui)
+        await command.handler(ui, "ignored")
 
     assert ui.lines == [
         "MEMORY.md\nproject_knowledge_api.md",

@@ -1,5 +1,6 @@
 """命令处理器可使用的最小 UI 能力。"""
 
+import asyncio
 from typing import Protocol
 
 from ..permission import Mode
@@ -24,6 +25,12 @@ class UI(Protocol):
     def open_resume_menu(self) -> None: ...
     def clear_and_new_session(self) -> None: ...
     def idle(self) -> bool: ...
+    def skill_list(self) -> list[tuple[str, str, str]]: ...
+    def skill_info(self, name: str) -> str | None: ...
+    def reload_skills(self) -> None: ...
+    def append_system_message(self, name: str, result: str) -> None: ...
+    def clear_active_skills(self) -> None: ...
+    def track_skill_task(self, task: asyncio.Task[None]) -> None: ...
 
 
 class NopUI:
@@ -80,3 +87,21 @@ class NopUI:
 
     def idle(self) -> bool:
         return True
+
+    def skill_list(self) -> list[tuple[str, str, str]]:
+        return []
+
+    def skill_info(self, name: str) -> str | None:
+        return None
+
+    def reload_skills(self) -> None:
+        pass
+
+    def append_system_message(self, name: str, result: str) -> None:
+        pass
+
+    def clear_active_skills(self) -> None:
+        pass
+
+    def track_skill_task(self, task: asyncio.Task[None]) -> None:
+        pass

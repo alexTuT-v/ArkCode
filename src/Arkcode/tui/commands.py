@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import os
+import asyncio
 from typing import TYPE_CHECKING
 
 from rich.text import Text
@@ -70,7 +70,7 @@ class AppUI(UI):
         return self.app.provider.model if self.app.provider is not None else ""
 
     def cwd(self) -> str:
-        return os.getcwd()
+        return str(self.app.workspace)
 
     def tool_count(self) -> int:
         return self.app._tool_registry.count()
@@ -115,9 +115,7 @@ class AppUI(UI):
         begin_resume(self.app)
 
     def clear_and_new_session(self) -> None:
-        workspace = str(self.app.runtime.session.session_dir)
-        workspace = str(os.path.dirname(os.path.dirname(os.path.dirname(workspace))))
-        context = new_session_context(workspace)
+        context = new_session_context(str(self.app.workspace))
         writer = Writer(context.session_dir)
         if self.app.provider is not None:
             writer.set_model(self.app.provider.model)
@@ -134,14 +132,65 @@ class AppUI(UI):
         self.app.usage_cache_read = 0
         self.app.usage_cache_creation = 0
         self.app.query_one("#log", RichLog).clear()
+        self.clear_active_skills()
         previous.close()
 
     def idle(self) -> bool:
         return self.app.state is type(self.app.state).IDLE
 
+    def skill_list(self) -> list[tuple[str, str, str]]:
+        return [
+            (
+                name,
+                description,
+                self.app.skill_loader.get_source_label(name) or "unknown",
+            )
+            for name, description in self.app.skill_loader.get_catalog()
+        ]
+
+    def skill_info(self, name: str) -> str | None:
+        skill = self.app.skill_loader.get(name)
+        if skill is None:
+            return None
+        source = self.app.skill_loader.get_source_label(skill.name) or "unknown"
+        model = skill.model or "default"
+        directory = str(skill.is_directory).lower()
+        return "\n".join(
+            (
+                f"name: {skill.name}",
+                f"description: {skill.description}",
+                f"mode: {skill.mode}",
+                f"model: {model}",
+                f"context: {skill.context}",
+                f"source: {source}",
+                f"path: {skill.source_path}",
+                f"directory: {directory}",
+            )
+        )
+
+    def reload_skills(self) -> None:
+        self.app.skill_loader.reload()
+        self.app._refresh_skill_integration()
+
+    def append_system_message(self, name: str, result: str) -> None:
+        content = (
+            f"<system-reminder>\nSkill '{name}' result:\n{result}\n</system-reminder>"
+        )
+        self.app.conv.add_user(content)
+        self.app.query_one("#log", RichLog).write(
+            Text(f"[{name}] {result}", style="dim")
+        )
+
+    def clear_active_skills(self) -> None:
+        if self.app.agent is not None:
+            self.app.agent.clear_active_skills()
+
+    def track_skill_task(self, task: asyncio.Task[None]) -> None:
+        self.app.track_skill_task(task)
+
 
 async def dispatch_slash(app: ArkCodeApp, text: str) -> bool:
-    name, is_slash = parse(text)
+    name, args, is_slash = parse(text)
     if not is_slash:
         return False
     command = app.cmd_registry.lookup(name)
@@ -155,7 +204,7 @@ async def dispatch_slash(app: ArkCodeApp, text: str) -> bool:
         ui.error("请等待当前任务完成")
         return True
     try:
-        await command.handler(ui)
+        await command.handler(ui, args)
         await ui.drain()
     except Exception as error:
         ui.error(str(error))

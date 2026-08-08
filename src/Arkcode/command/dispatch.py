@@ -1,16 +1,15 @@
 """Slash Command 输入识别。"""
 
 
-def parse(input_text: str) -> tuple[str, bool]:
+def parse(input_text: str) -> tuple[str, str, bool]:
     value = input_text.strip()
     if not value.startswith("/"):
-        return "", False
+        return "", "", False
     body = value[1:]
     if not body:
-        return "", True
+        return "", "", True
     if body[0].isspace():
-        return "", True
+        return "", body.strip(), True
     parts = body.split(maxsplit=1)
-    if len(parts) != 1:
-        return "", True
-    return parts[0].lower(), True
+    args = parts[1].strip() if len(parts) == 2 else ""
+    return parts[0].lower(), args, True

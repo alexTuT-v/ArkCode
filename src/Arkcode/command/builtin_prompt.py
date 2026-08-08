@@ -10,10 +10,10 @@ REVIEW_DIRECTIVE = (
 )
 
 
-async def handle_do(ui: UI) -> None:
+async def handle_do(ui: UI, args: str) -> None:
     ui.set_mode(Mode.DEFAULT)
     ui.inject_and_send("/do", EXECUTE_DIRECTIVE)
 
 
-async def handle_review(ui: UI) -> None:
+async def handle_review(ui: UI, args: str) -> None:
     ui.inject_and_send("/review", REVIEW_DIRECTIVE)

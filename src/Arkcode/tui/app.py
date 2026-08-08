@@ -1,7 +1,6 @@
 """ArkCode 的 Textual 应用与会话状态机。"""
 
 import asyncio
-import os
 import time
 from enum import Enum
 from pathlib import Path
@@ -17,7 +16,11 @@ from textual.widgets import OptionList, RichLog, Static, TextArea
 
 from ..agent import Agent, ApprovalRequest, SessionRuntime
 from ..command import Registry as CommandRegistry
-from ..command import register_builtins
+from ..command import (
+    register_builtins,
+    register_skill_commands,
+    register_skill_management,
+)
 from ..compact import (
     CompactCircuitBreaker,
     ContentReplacementState,
@@ -30,9 +33,10 @@ from ..llm import Provider, new_provider
 from ..mcp import McpStatus
 from ..memory import Manager as MemoryManager
 from ..permission import Engine, Mode, Outcome
-from ..prompt import render_banner
+from ..prompt import render_banner, render_skill_catalog
 from ..session import Writer
-from ..tool import Registry
+from ..skills import SkillExecutor, SkillLoader
+from ..tool import InstallSkillTool, LoadSkillTool, Registry
 from .commands import dispatch_slash
 from .complete import CompletionMenu
 from .resume import SessionItem, begin_resume, do_resume_session, handle_resume_key
@@ -184,21 +188,39 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         instruction_text: str = "",
         memory_text: str = "",
         sessions_dir: str | None = None,
+        workspace: str | Path | None = None,
     ) -> None:
         super().__init__()
         self.providers = providers
         self._version = version
+        if workspace is not None:
+            self.workspace = Path(workspace).resolve()
+        elif runtime is not None:
+            self.workspace = Path(runtime.session.session_dir).resolve().parents[2]
+        else:
+            self.workspace = Path.cwd().resolve()
         # Textual 的 App 已占用 ``_registry`` 管理 DOM 节点。
         self._tool_registry = registry
+        self.skill_loader = SkillLoader(self.workspace)
+        self.skill_loader.load_all()
+        self.load_skill_tool = LoadSkillTool(self.skill_loader)
+        self._tool_registry.register(self.load_skill_tool)
+        self.install_skill_tool = InstallSkillTool(
+            self.skill_loader,
+            Path.home() / ".Arkcode" / "skills",
+            self._refresh_skill_integration,
+        )
+        self._tool_registry.register(self.install_skill_tool)
+        self.skill_executor: SkillExecutor | None = None
         self.cmd_registry = CommandRegistry()
-        register_builtins(self.cmd_registry)
+        self._rebuild_command_registry()
         self.completion = CompletionMenu()
         self.engine = engine
         self.runtime = runtime or SessionRuntime(
             replacement=ContentReplacementState(),
             recovery=RecoveryState(),
             auto_tracking=CompactCircuitBreaker(),
-            session=new_session_context(os.getcwd()),
+            session=new_session_context(str(self.workspace)),
         )
         self.agent: Agent | None = None
         self._pending_command = ""
@@ -237,6 +259,27 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         self.cur_thinking = ""
         self.cur_tools: list[ToolDisplay] = []
         self.turn_cancel: asyncio.Event | None = None
+        self._fork_tasks: set[asyncio.Task[None]] = set()
+
+    def _rebuild_command_registry(self) -> None:
+        self.cmd_registry.clear()
+        register_builtins(self.cmd_registry)
+        register_skill_management(self.cmd_registry, self.skill_loader)
+        if self.skill_executor is not None:
+            register_skill_commands(
+                self.cmd_registry,
+                self.skill_loader,
+                self.skill_executor,
+            )
+
+    def _refresh_skill_integration(self) -> None:
+        """在 Loader 已刷新后同步命令表与 Agent Catalog。"""
+
+        if self.agent is not None:
+            self.agent.set_skill_catalog(
+                render_skill_catalog(self.skill_loader.get_catalog())
+            )
+        self._rebuild_command_registry()
 
     def compose(self) -> ComposeResult:
         if len(self.providers) > 1:
@@ -261,7 +304,7 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         self.resume_list = self.query_one("#resume-list", OptionList)
         self.resume_list.display = False
         log = self.query_one("#log", RichLog)
-        log.write(render_banner(self._version, os.getcwd()))
+        log.write(render_banner(self._version, str(self.workspace)))
         if self.mcp_status is not None:
             summary = mcp_status_line(self.mcp_status)
             if summary is not None:
@@ -271,7 +314,13 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
             return
         self._show_selection()
 
-    def on_unmount(self) -> None:
+    async def on_unmount(self) -> None:
+        pending = list(self._fork_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._fork_tasks.clear()
         self.writer.close()
 
     def _show_selection(self) -> None:
@@ -302,6 +351,24 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
             memory_manager=self.mem_mgr,
             instruction_text=self.instruction_text,
             memory_text=self.memory_text,
+        )
+        self.load_skill_tool.set_agent(self.agent)
+        self.skill_executor = SkillExecutor(
+            self.agent,
+            self.conv,
+            config,
+            self._tool_registry,
+            self.engine,
+            self._version,
+            self.workspace,
+        )
+        self.agent.set_skill_catalog(
+            render_skill_catalog(self.skill_loader.get_catalog())
+        )
+        register_skill_commands(
+            self.cmd_registry,
+            self.skill_loader,
+            self.skill_executor,
         )
         self.state = SessionState.IDLE
         option_list = self.query("#provider-select")
@@ -539,6 +606,12 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         if self.turn_cancel is not None:
             self.turn_cancel.set()
 
+    def track_skill_task(self, task: asyncio.Task[None]) -> None:
+        """持有 fork 任务直到完成，避免悬空并支持退出取消。"""
+
+        self._fork_tasks.add(task)
+        task.add_done_callback(self._fork_tasks.discard)
+
     def action_cycle_mode(self) -> None:
         if self.state is not SessionState.IDLE:
             return
@@ -561,6 +634,7 @@ def new_app(
     instruction_text: str = "",
     memory_text: str = "",
     sessions_dir: str | None = None,
+    workspace: str | Path | None = None,
 ) -> ArkCodeApp:
     """构造注入权限引擎的 TUI 应用。"""
 
@@ -576,4 +650,5 @@ def new_app(
         instruction_text,
         memory_text,
         sessions_dir,
+        workspace,
     )

@@ -4,7 +4,7 @@ from Arkcode.command import Command, Kind, Registry
 from Arkcode.command.ui import NopUI
 
 
-async def _noop(ui: NopUI) -> None:
+async def _noop(ui: NopUI, args: str) -> None:
     return None
 
 
@@ -56,3 +56,30 @@ def test_prefix_matches_visible_primary_names_only() -> None:
     ]
     assert registry.prefix_match("/state") == []
     assert registry.prefix_match("/description") == []
+
+
+def test_register_replace_removes_old_name_aliases_and_visible_entry() -> None:
+    registry = Registry()
+    old = command("review", aliases=["r"])
+    replacement = command("review", aliases=["inspect"])
+    registry.register(old)
+
+    registry.register(replacement, replace=True)
+
+    assert registry.lookup("review") is replacement
+    assert registry.lookup("r") is None
+    assert registry.lookup("inspect") is replacement
+    assert registry.visible() == [replacement]
+
+
+def test_clear_removes_all_command_indexes() -> None:
+    registry = Registry()
+    registry.register(command("help", aliases=["h"]))
+    registry.register(command("secret", hidden=True))
+
+    registry.clear()
+
+    assert registry.lookup("help") is None
+    assert registry.lookup("h") is None
+    assert registry.visible() == []
+    assert registry.prefix_match("") == []

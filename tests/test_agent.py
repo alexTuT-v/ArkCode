@@ -172,6 +172,17 @@ class LargeResultTool(InstrumentedTool):
         return Result("x" * 30000)
 
 
+class ActivatingSkillTool(InstrumentedTool):
+    def __init__(self) -> None:
+        super().__init__("LoadSkill", True)
+        self.agent: Agent | None = None
+
+    async def execute(self, args: str) -> Result:
+        assert self.agent is not None
+        self.agent.activate_skill("review", "Check every bug")
+        return Result("activated")
+
+
 def registry_with(*tools: InstrumentedTool) -> Registry:
     registry = Registry()
     for tool in tools:
@@ -256,6 +267,78 @@ async def test_agent_injects_context_and_schedules_memory_update(
     stable = provider.requests[0].system.stable
     assert "project instruction" in stable
     assert "fresh memory" in stable
+
+
+@pytest.mark.asyncio
+async def test_agent_rebuilds_skill_environment_between_iterations(
+    tmp_path: Path,
+) -> None:
+    tool_call = call("skill-1", "LoadSkill")
+    provider = FakeProvider(
+        [
+            [complete(tool_call), end()],
+            [TextDelta("done"), end()],
+        ]
+    )
+    tool = ActivatingSkillTool()
+    registry = Registry()
+    registry.register(tool)
+    conversation = Conversation()
+    conversation.add_user("review this")
+    agent = Agent(provider, registry, runtime=runtime(tmp_path))
+    tool.agent = agent
+    agent.set_skill_catalog("## Available Skills\n\n- review: Review code")
+
+    await collect(agent, conversation)
+
+    first = provider.requests[0].system
+    second = provider.requests[1].system
+    assert "Available Skills" in first.environment
+    assert "Check every bug" not in first.environment
+    assert "## Active Skills" in second.environment
+    assert "Check every bug" in second.environment
+    assert "Check every bug" not in second.stable
+
+
+@pytest.mark.asyncio
+async def test_load_skill_is_read_only_without_permission_approval(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider(
+        [
+            [complete(call("skill-1", "LoadSkill")), end()],
+            [TextDelta("done"), end()],
+        ]
+    )
+    tool = ActivatingSkillTool()
+    registry = Registry()
+    registry.register(tool)
+    conversation = Conversation()
+    conversation.add_user("review")
+    engine, error = new_engine(str(tmp_path))
+    assert error is None
+    agent = Agent(provider, registry, engine=engine, runtime=runtime(tmp_path))
+    tool.agent = agent
+
+    events = await collect(agent, conversation)
+
+    assert not [event for event in events if event.approval is not None]
+    assert agent.active_skills == {"review": "Check every bug"}
+
+
+def test_agent_reactivates_and_clears_skills_without_changing_catalog() -> None:
+    agent = Agent(FakeProvider([]), Registry())
+    agent.set_skill_catalog("catalog")
+    agent.activate_skill("review", "v1")
+    agent.activate_skill("commit", "commit")
+    agent.activate_skill("review", "v2")
+
+    assert agent.active_skills == {"review": "v2", "commit": "commit"}
+
+    agent.clear_active_skills()
+
+    assert agent.active_skills == {}
+    assert agent._skill_catalog == "catalog"
 
 
 @pytest.mark.asyncio
@@ -784,6 +867,41 @@ async def test_plan_mode_refuses_side_effect_call_returned_by_provider() -> None
 
 
 @pytest.mark.asyncio
+async def test_plan_mode_refuses_install_skill_with_permission_engine(
+    tmp_path: Path,
+) -> None:
+    tracker = Tracker()
+    provider = FakeProvider(
+        [
+            [complete(call("install-1", "InstallSkill")), end()],
+            [TextDelta("未安装"), end()],
+        ]
+    )
+    conversation = Conversation()
+    conversation.add_user("只做计划")
+    engine, error = new_engine(str(tmp_path))
+    assert error is None
+
+    events = await collect(
+        Agent(
+            provider,
+            registry_with(
+                InstrumentedTool("InstallSkill", False, tracker=tracker),
+            ),
+            engine=engine,
+        ),
+        conversation,
+        mode=Mode.PLAN,
+    )
+
+    assert tracker.starts == []
+    assert not [event for event in events if event.approval is not None]
+    result = conversation.messages()[2].tool_results[0]
+    assert result.is_error is True
+    assert "Plan Mode" in result.content
+
+
+@pytest.mark.asyncio
 async def test_direct_task_cancel_closes_pending_provider_stream() -> None:
     provider = BlockingProvider()
     conversation = Conversation()
@@ -960,6 +1078,35 @@ async def test_permission_approval_controls_side_effect_execution(
     assert result.tool_call_id == "write-1"
     assert result.is_error is is_error
     assert provider.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_install_skill_requires_default_mode_approval(tmp_path: Path) -> None:
+    tracker = Tracker()
+    requested = call("install-1", "InstallSkill")
+    provider = FakeProvider(
+        [[complete(requested), end()], [TextDelta("未安装"), end()]]
+    )
+    conversation = Conversation()
+    conversation.add_user("安装 Skill")
+    engine, error = new_engine(str(tmp_path))
+    assert error is None
+    agent = Agent(
+        provider,
+        registry_with(
+            InstrumentedTool("InstallSkill", False, tracker=tracker),
+        ),
+        engine=engine,
+    )
+    approvals = []
+
+    async for event in agent.run(conversation, Mode.DEFAULT, asyncio.Event()):
+        if event.approval is not None:
+            approvals.append(event.approval)
+            event.approval.respond.set_result(Outcome.DENY_ONCE)
+
+    assert [approval.name for approval in approvals] == ["InstallSkill"]
+    assert tracker.starts == []
 
 
 @pytest.mark.asyncio

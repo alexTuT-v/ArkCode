@@ -472,13 +472,17 @@ async def test_completion_filters_and_executes_highlighted_command(
         input_box.text = "/"
         await pilot.pause()
         assert app.completion.active is True
-        assert len(app.completion.items) == 12
+        assert len(app.completion.items) == 13
 
         input_box.text = "/s"
         await pilot.pause()
-        assert [item.name for item in app.completion.items] == ["session", "status"]
+        assert [item.name for item in app.completion.items] == [
+            "session",
+            "skill",
+            "status",
+        ]
 
-        await pilot.press("down", "tab")
+        await pilot.press("down", "down", "tab")
         await pilot.pause()
         output = log_text(app.query_one("#log", RichLog))
         assert "ArkCode Status" in output
@@ -500,7 +504,7 @@ async def test_completion_enter_executes_highlighted_command(
         input_box.text = "/s"
         await pilot.pause()
 
-        await pilot.press("down", "enter")
+        await pilot.press("down", "down", "enter")
         await pilot.pause()
 
         assert "ArkCode Status" in log_text(app.query_one("#log", RichLog))
@@ -535,7 +539,7 @@ async def test_command_handler_errors_are_rendered_without_escaping(
     monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
     app = make_app([provider_config()])
 
-    async def broken(ui: object) -> None:
+    async def broken(ui: object, args: str) -> None:
         raise RuntimeError("command failed")
 
     app.cmd_registry.register(Command("broken", "break", Kind.LOCAL, broken))
@@ -929,7 +933,7 @@ async def test_submit_streams_then_stores_markdown_reply(
         assert app.state is SessionState.IDLE
         assert app.query_one("#input", TextArea).disabled is False
         assert provider.received[0][0] == [Message(role="user", content="第一轮")]
-        assert len(provider.received[0][1]) == 6
+        assert len(provider.received[0][1]) == 8
         assert app.conv.messages() == [
             Message(role="user", content="第一轮"),
             Message(role="assistant", content="**你好**"),
@@ -1099,6 +1103,7 @@ async def test_plan_then_do_switches_mode_and_executes_immediately(
             "read_file",
             "glob",
             "grep",
+            "LoadSkill",
         ]
         assert provider.received[0][2] == plan_reminder(full=True)
 
@@ -1106,7 +1111,7 @@ async def test_plan_then_do_switches_mode_and_executes_immediately(
         await wait_until_idle(pilot, app)
 
         assert app.mode is Mode.NORMAL
-        assert len(provider.received[1][1]) == 6
+        assert len(provider.received[1][1]) == 8
         assert provider.received[1][2] == ""
         assert provider.received[1][0][-1] == Message(
             role="user",

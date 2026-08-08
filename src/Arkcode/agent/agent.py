@@ -38,7 +38,12 @@ from ..llm import (
 )
 from ..memory import Manager
 from ..permission import Decision, Engine, Mode, Outcome, new_engine
-from ..prompt import build_system_prompt, gather_environment, plan_reminder
+from ..prompt import (
+    build_system_prompt,
+    gather_environment,
+    plan_reminder,
+    render_active_skills,
+)
 from ..tool import DEFAULT_TIMEOUT, Registry
 from ..tool.base import ToolDefinition
 from .event import CompactEvent, CompactPhase
@@ -214,7 +219,18 @@ class Agent:
         self._memory_manager = memory_manager
         self._instruction_text = instruction_text
         self._memory_text = memory_text
+        self.active_skills: dict[str, str] = {}
+        self._skill_catalog = ""
         self._run_lock = asyncio.Lock()
+
+    def activate_skill(self, name: str, prompt_body: str) -> None:
+        self.active_skills[name] = prompt_body
+
+    def clear_active_skills(self) -> None:
+        self.active_skills.clear()
+
+    def set_skill_catalog(self, catalog: str) -> None:
+        self._skill_catalog = catalog
 
     @staticmethod
     def _recent_turn(messages: list[Message]) -> list[Message]:
@@ -247,9 +263,9 @@ class Agent:
         call: ToolCall,
         read_only: bool,
     ) -> tuple[Decision, str]:
+        if mode is Mode.PLAN and not read_only:
+            return Decision.DENY, "Plan Mode 不允许执行有副作用的工具"
         if not self._permissions_enabled:
-            if mode is Mode.PLAN and not read_only:
-                return Decision.DENY, "Plan Mode 不允许执行有副作用的工具"
             return Decision.ALLOW, ""
         return self._engine.check(mode, call, read_only)
 
@@ -595,10 +611,7 @@ class Agent:
             if self._memory_manager is not None
             else self._memory_text
         )
-        system = System(
-            stable=build_system_prompt(self._instruction_text, memory_text),
-            environment=environment.render(),
-        )
+        stable_system = build_system_prompt(self._instruction_text, memory_text)
 
         unknown_run = 0
         for iteration in range(1, MAX_ITERATIONS + 1):
@@ -654,6 +667,19 @@ class Agent:
             if mode is Mode.PLAN:
                 full = iteration == 1 or (iteration - 1) % PLAN_REMINDER_INTERVAL == 0
                 reminder = plan_reminder(full)
+            dynamic_environment = "\n\n".join(
+                part
+                for part in (
+                    environment.render(),
+                    self._skill_catalog,
+                    render_active_skills(self.active_skills),
+                )
+                if part
+            )
+            system = System(
+                stable=stable_system,
+                environment=dynamic_environment,
+            )
             async for event in self._stream_once(
                 conv,
                 definitions,

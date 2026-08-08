@@ -1,306 +1,773 @@
-# 多协议 LLM 终端对话客户端 Tasks
+# Skill 系统 Implementation Tasks
 
-> 包名：`Arkcode`（Python 3.12+）。源码位于 `src/Arkcode/`，内部模块以 `Arkcode.xxx` 导入。
+> **执行要求：** 按顺序使用 TDD 完成。每个任务先运行失败测试，再写最小实现；任务验证
+> 全绿后才能进入下一项。实现阶段使用 `superpowers:executing-plans`，直接在当前分支工作。
+
+**目标：** 在 ArkCode 中实现可加载、热更新、inline/fork 执行、Slash 显式调用、
+LoadSkill 自动激活和安全远程安装的完整 Skill 系统。
+
+**架构：** `SkillMeta -> SkillLoader -> SkillExecutor` 是核心链路；Agent 每轮重建
+Skills environment；Tool、Command 与 TUI 只做协议适配和生命周期组装。
+
+**技术栈：** Python 3.12+、PyYAML、httpx、Textual、pytest、pytest-asyncio、ruff、mypy。
+
+## 全局约束
+
+- 源码路径统一使用 `src/Arkcode/`，测试路径统一使用 `tests/`。
+- 项目 `.Arkcode/skills/` 优先于用户 `~/.Arkcode/skills/`。
+- `mode` 默认 `inline`；`context` 默认 `full`。
+- 无 `$ARGUMENTS` 占位符时正文必须保持不变。
+- LoadSkill 必须是 read-only；InstallSkill 必须是 write。
+- fork 不得修改主 Conversation、主 SessionRuntime 或主 Agent Active Skills。
+- 安装限额固定为：1 MiB/文件、8 MiB 总量、64 文件、递归深度 4。
+- 不覆盖用户已有 Skill 目录，不使用本地 git，不下载任意 ZIP。
+
+---
 
 ## 文件清单
 
 | 操作 | 文件 | 职责 |
 |------|------|------|
-| 新建 | `pyproject.toml` | PEP 621 项目元数据、依赖、脚本入口 |
-| 新建 | `.env.example` | 脱敏的多 provider 配置模板 |
-| 修改 | `.gitignore` | 忽略 `.env` |
-| 新建 | `src/Arkcode/__init__.py` | 包标识、版本号 `__version__` |
-| 新建 | `src/Arkcode/__main__.py` | `python -m Arkcode` 入口（转调 `cli.main`） |
-| 新建 | `src/Arkcode/config.py` | `Config` / `ProviderConfig`、`load`、校验 |
-| 新建 | `src/Arkcode/prompt.py` | `SYSTEM_PROMPT`、`CAT_BANNER`、`render_banner` |
-| 新建 | `src/Arkcode/llm/__init__.py` | `Provider` Protocol、`Message`、`StreamEvent`、`new_provider` 工厂 |
-| 新建 | `src/Arkcode/conversation.py` | 单会话多轮历史 |
-| 新建 | `src/Arkcode/llm/anthropic_provider.py` | anthropic 适配器 |
-| 新建 | `src/Arkcode/llm/openai_provider.py` | openai 适配器 |
-| 新建 | `src/Arkcode/tui/__init__.py` | TUI 包标识 |
-| 新建 | `src/Arkcode/tui/app.py` | `ArkCodeApp`、状态机、`run` |
-| 新建 | `src/Arkcode/tui/stream.py` | `_consume_stream`、`_tick` 计时 |
-| 新建 | `src/Arkcode/tui/select.py` | provider 选择（`OptionList`） |
-| 新建 | `src/Arkcode/tui/view.py` | 渲染拼装、状态栏、错误样式、markdown 定型 |
-| 新建 | `src/Arkcode/cli.py` | 入口装配 |
-| 新建 | `tests/test_config.py` | config 单测 |
-| 新建 | `tests/test_conversation.py` | conversation 单测 |
+| 新建 | `src/Arkcode/skills/__init__.py` | Skill 公共导出 |
+| 新建 | `src/Arkcode/skills/parser.py` | `SkillMeta`、frontmatter、参数替换 |
+| 新建 | `src/Arkcode/skills/loader.py` | 两级扫描、优先级、缓存、热重载 |
+| 新建 | `src/Arkcode/skills/executor.py` | inline/fork 执行 |
+| 新建 | `src/Arkcode/skills/install.py` | URL 解析、Contents API 下载、原子安装 |
+| 新建 | `src/Arkcode/tool/load_skill.py` | read-only LoadSkill 工具 |
+| 新建 | `src/Arkcode/tool/install_skill.py` | write InstallSkill 工具 |
+| 新建 | `src/Arkcode/command/skills.py` | `/skill` 与动态 Skill 命令 |
+| 修改 | `src/Arkcode/agent/agent.py` | Active Skills、Catalog、逐轮 environment |
+| 修改 | `src/Arkcode/tool/registry.py` | `without()` 隔离视图 |
+| 修改 | `src/Arkcode/tool/__init__.py` | 新工具导出 |
+| 修改 | `src/Arkcode/command/command.py` | Handler 接收 args |
+| 修改 | `src/Arkcode/command/dispatch.py` | 返回 name/args/is_slash |
+| 修改 | `src/Arkcode/command/registry.py` | replace、clear |
+| 修改 | `src/Arkcode/command/ui.py` | Skill 管理与回流能力 |
+| 修改 | `src/Arkcode/command/builtin_*.py` | 兼容参数化 Handler |
+| 修改 | `src/Arkcode/command/builtins.py` | 注册 `/skill` 管理命令 |
+| 修改 | `src/Arkcode/prompt/builder.py` | Skills 渲染函数 |
+| 修改 | `src/Arkcode/prompt/modules.py` | Catalog 扩展槽位 |
+| 修改 | `src/Arkcode/prompt/__init__.py` | 新渲染函数导出 |
+| 修改 | `src/Arkcode/tui/app.py` | Loader/Tool/Executor 生命周期与后台任务 |
+| 修改 | `src/Arkcode/tui/commands.py` | AppUI Skill 能力、clear 钩子 |
+| 修改 | `src/Arkcode/cli.py` | 显式传入 workspace |
+| 修改 | `pyproject.toml` | 新增 httpx 依赖 |
+| 新建 | `tests/test_skills_parser.py` | Parser 单测 |
+| 新建 | `tests/test_skills_loader.py` | Loader 单测 |
+| 新建 | `tests/test_skills_executor.py` | inline/fork 单测 |
+| 新建 | `tests/test_skills_install.py` | 安装器单测 |
+| 新建 | `tests/test_skill_tools.py` | LoadSkill/InstallSkill 单测 |
+| 新建 | `tests/test_command_skills.py` | 参数化 Slash 与 Skill 命令单测 |
+| 新建 | `tests/test_prompt_skills.py` | Catalog/Active Skills 单测 |
+| 修改 | `tests/test_agent.py` | 逐 iteration 激活集成测试 |
+| 修改 | `tests/test_tui.py` | 启动、reload、clear、fork 回流测试 |
 
 ---
 
-## T1: 初始化 Python 项目骨架与依赖
-**文件：** `pyproject.toml`、`src/Arkcode/__init__.py`、`src/Arkcode/__main__.py`、`src/Arkcode/cli.py`（临时占位）
+## T1：SkillMeta 与 frontmatter 解析
+
+**文件：**
+
+- 新建 `src/Arkcode/skills/parser.py`
+- 新建 `src/Arkcode/skills/__init__.py`
+- 新建 `tests/test_skills_parser.py`
+
 **依赖：** 无
-**步骤：**
-1. 用 `uv init` 或手写 `pyproject.toml`，关键字段：
-   ```toml
-   [project]
-   name = "Arkcode"
-   version = "0.1.0"
-   requires-python = ">=3.12"
-   dependencies = [
-     "textual>=0.80",
-     "rich>=13",
-     "anthropic>=0.40",
-     "openai>=1.50",
-     "python-dotenv>=1.0",
-   ]
 
-   [project.scripts]
-   Arkcode = "Arkcode.cli:main"
+**产出接口：**
 
-   [build-system]
-   requires = ["hatchling"]
-   build-backend = "hatchling.build"
+```python
+class SkillParseError(ValueError): ...
 
-   [tool.hatch.build.targets.wheel]
-   packages = ["src/Arkcode"]
+@dataclass(frozen=True, slots=True)
+class SkillMeta:
+    name: str
+    description: str
+    prompt_body: str
+    mode: Literal["inline", "fork"] = "inline"
+    model: str | None = None
+    context: Literal["full", "recent", "none"] = "full"
+    source_path: Path = Path()
+    is_directory: bool = False
 
-   [dependency-groups]
-   dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.10"]
-   ```
-2. `src/Arkcode/__init__.py`：定义 `__version__ = "0.1.0"`。
-3. `src/Arkcode/__main__.py`：`from .cli import main; main()`。
-4. `src/Arkcode/cli.py` 写一个临时 `main()`，打印 `f"Arkcode {__version__}"` 并退出，确保可启动。
-5. 安装依赖：`uv sync`（推荐）或 `pip install -e ".[dev]"`。
+def parse_frontmatter(raw: str) -> tuple[dict[str, object], str]: ...
+def parse_skill_file(path: Path, *, is_directory: bool = False) -> SkillMeta: ...
+def substitute_arguments(prompt_body: str, args: str) -> str: ...
+```
 
-**验证：** `python -m Arkcode` 能打印版本号；`uv run Arkcode`（或 `Arkcode`）同样可用；`uv pip list` / `pip list` 能看到上述依赖。
+- [x] **T1.1 写失败测试**：覆盖合法 frontmatter、缺开头、缺结束、非法 YAML、非
+  mapping、缺 name/description、非法 name/mode/context/model、默认值、目录标记、文件
+  不存在和 `$ARGUMENTS` 多次替换/无占位符原样返回。
 
-## T2: config 模块
-**文件：** `src/Arkcode/config.py`、`tests/test_config.py`
+```python
+def test_parse_skill_defaults(tmp_path: Path) -> None:
+    path = tmp_path / "commit.md"
+    path.write_text("---\nname: commit\ndescription: Commit code\n---\nDo it")
+    skill = parse_skill_file(path)
+    assert (skill.mode, skill.context, skill.prompt_body) == ("inline", "full", "Do it")
+
+def test_substitute_without_placeholder_is_unchanged() -> None:
+    assert substitute_arguments("Do it", "extra") == "Do it"
+```
+
+- [x] **T1.2 运行失败测试**。
+
+```bash
+.venv/bin/pytest -q tests/test_skills_parser.py
+```
+
+预期：因 `Arkcode.skills.parser` 不存在而失败。
+
+- [x] **T1.3 实现最小 Parser**：使用 `yaml.safe_load`，按 Plan 的字段、默认值和正则
+  校验；`source_path` 保存绝对路径。
+
+- [x] **T1.4 验证**。
+
+```bash
+.venv/bin/pytest -q tests/test_skills_parser.py
+.venv/bin/ruff check src/Arkcode/skills tests/test_skills_parser.py
+```
+
+预期：全部通过。
+
+---
+
+## T2：SkillLoader 两级扫描与热重载
+
+**文件：**
+
+- 新建 `src/Arkcode/skills/loader.py`
+- 修改 `src/Arkcode/skills/__init__.py`
+- 新建 `tests/test_skills_loader.py`
+
 **依赖：** T1
-**步骤：**
-1. 保留 `ProviderConfig` / `Config` 对外结构；将 `api_key` 声明为
-   `field(repr=False)`，避免配置对象表示泄露密钥。
-2. 定义 `class ConfigError(Exception)`。
-3. 实现 `load(path: str) -> Config`：先检查文件存在，再调用
-   `load_dotenv(dotenv_path=path, override=True)`；读取并解析 `ARKCODE_PROVIDERS`。
-4. provider 名称按逗号切分、去除首尾空格并保留原顺序；仅允许字母、数字、下划线，
-   大小写归一后不得重复。以大写名称读取
-   `ARKCODE_<NAME>_{PROTOCOL,MODEL,BASE_URL,API_KEY,THINKING}`。
-5. 校验 `PROTOCOL` / `MODEL` / `API_KEY` 必填，协议仅允许 `anthropic` / `openai`；
-   `THINKING` 缺省为 `false` 且仅接受 `true` / `false`；空 `BASE_URL` 转为 `None`。
-6. 所有错误使用变量名定位但不包含变量值；文件不存在、列表为空、名称/字段非法均转为
-   可读 `ConfigError`。
-7. 扩充 `tests/test_config.py`：覆盖单/多 provider、顺序、大小写前缀、空格、重复/非法名称、
-   缺字段、非法协议/thinking、空 base_url、`.env` 覆盖系统环境变量，以及错误与 `repr`
-   不泄露 API key。
 
-**验证：** `pytest tests/test_config.py` 通过；`ruff check src/Arkcode/config.py` 无告警。
+**产出接口：**
 
-## T3: 配置模板与忽略
-**文件：** `.env.example`、`.gitignore`
-**依赖：** T2
-**步骤：**
-1. 写 `.env.example`：使用 `ARKCODE_PROVIDERS=anthropic,openai`，并为两项提供完整
-   `ARKCODE_<NAME>_*` 示例；API key 仅使用占位符。
-2. `.gitignore` 追加 `.env`；旧 `.Arkcode/config.yaml` 可继续忽略，但实现不再读取。
-3. 从项目依赖移除 `pyyaml` / `types-pyyaml`，加入 `python-dotenv` 并更新锁文件。
+```python
+class SkillLoader:
+    def __init__(self, work_dir: str | Path) -> None: ...
+    def load_all(self) -> list[SkillMeta]: ...
+    def reload(self) -> list[SkillMeta]: ...
+    def get(self, name: str) -> SkillMeta | None: ...
+    def get_catalog(self) -> list[tuple[str, str]]: ...
+    def get_source_label(self, name: str) -> Literal["project", "user"] | None: ...
+```
 
-**验证：** 复制 example 为 `.env` 后 `config.load(".env")` 通过；`git status` 确认 `.env`
-被忽略；依赖树中不再包含项目直接声明的 PyYAML。
+- [x] **T2.1 写失败测试**：使用 `monkeypatch(Path, "home", ...)` 隔离用户目录，覆盖
+  单文件、目录型、排序、项目覆盖用户、坏文件跳过、unknown、source label、reload
+  新增/删除、get 热更新成功和失败回退缓存。
 
-## T4: prompt 模块
-**文件：** `src/Arkcode/prompt.py`
+```python
+def test_project_skill_overrides_user_skill(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    loader = SkillLoader(tmp_path / "project")
+    # 测试 helper 分别写入 project/user 同名 Skill。
+    loader.load_all()
+    assert loader.get("review").description == "project"
+    assert loader.get_source_label("review") == "project"
+```
+
+- [x] **T2.2 运行失败测试**。
+
+```bash
+.venv/bin/pytest -q tests/test_skills_loader.py
+```
+
+- [x] **T2.3 实现 Loader**：project-first、first-wins；扫描结果字典序稳定；单条错误
+  `logging.warning`；`get` 重读失败回退 `_cache`。
+
+- [x] **T2.4 验证**。
+
+```bash
+.venv/bin/pytest -q tests/test_skills_parser.py tests/test_skills_loader.py
+.venv/bin/ruff check src/Arkcode/skills tests/test_skills_loader.py
+```
+
+---
+
+## T3：Slash 参数与 Registry 覆盖能力
+
+**文件：**
+
+- 修改 `src/Arkcode/command/command.py`
+- 修改 `src/Arkcode/command/dispatch.py`
+- 修改 `src/Arkcode/command/registry.py`
+- 修改 `src/Arkcode/command/builtin_local.py`
+- 修改 `src/Arkcode/command/builtin_ui.py`
+- 修改 `src/Arkcode/command/builtin_prompt.py`
+- 修改 `src/Arkcode/tui/commands.py`
+- 修改 `tests/test_command_dispatch.py`
+- 修改 `tests/test_command_registry.py`
+- 修改 `tests/test_command_builtins.py`
+- 修改 `tests/test_tui.py`
+
+**依赖：** 无
+
+**接口变更：**
+
+```python
+Handler = Callable[[UI, str], Awaitable[None]]
+def parse(input_text: str) -> tuple[str, str, bool]: ...
+def Registry.register(command: Command, *, replace: bool = False) -> None: ...
+def Registry.clear() -> None: ...
+```
+
+- [x] **T3.1 写失败测试**：`/skill info review` 返回
+  `("skill", "info review", True)`；普通文本、空 `/`、大小写与内部空白符合 Plan；
+  `replace=True` 同步清理旧 name/aliases/visible；`clear()` 清空全部索引。
+
+```python
+def test_parse_command_arguments() -> None:
+    assert parse(" /SKILL   info review ") == ("skill", "info review", True)
+
+def test_register_replace_removes_old_aliases() -> None:
+    registry.register(old)
+    registry.register(new, replace=True)
+    assert registry.lookup(old.aliases[0]) is None
+    assert registry.lookup(new.name) is new
+```
+
+- [x] **T3.2 运行失败测试**。
+
+```bash
+.venv/bin/pytest -q tests/test_command_dispatch.py tests/test_command_registry.py
+```
+
+- [x] **T3.3 修改 Handler 与所有调用方**：现有 builtin handler 增加未使用的 `args`
+  参数；dispatch 把 args 传给 handler；保持 12 条既有命令行为不变。
+
+- [x] **T3.4 验证 Slash 全回归**。
+
+```bash
+.venv/bin/pytest -q tests/test_command_dispatch.py tests/test_command_registry.py \
+  tests/test_command_builtins.py tests/test_command_complete.py tests/test_tui.py
+```
+
+---
+
+## T4：Skills Prompt 与 Agent 逐轮注入
+
+**文件：**
+
+- 修改 `src/Arkcode/prompt/builder.py`
+- 修改 `src/Arkcode/prompt/modules.py`
+- 修改 `src/Arkcode/prompt/__init__.py`
+- 修改 `src/Arkcode/agent/agent.py`
+- 新建 `tests/test_prompt_skills.py`
+- 修改 `tests/test_agent.py`
+
 **依赖：** T1
-**步骤：**
-1. 定义 `SYSTEM_PROMPT: str = """..."""`（一段简洁的固定 system prompt）。
-2. 定义 `CAT_BANNER: str = """..."""`（ASCII 猫：`/\\_/\\`、`( o.o )`、`> ^ <`）。
-3. 实现 `def render_banner(version: str, cwd: str) -> str`：拼出"猫 + ArkCode vX + cwd + 就绪提示行"。
 
-**验证：** `python -c "from Arkcode.prompt import render_banner; print(render_banner('0.1.0', '/tmp'))"` 输出含三要素与提示行。
+**产出接口：**
 
-## T5: llm 包骨架
-**文件：** `src/Arkcode/llm/__init__.py`
-**依赖：** T2
-**步骤：**
-1. 定义 `@dataclass class Message(role: Literal["user","assistant"], content: str)`、
-   `@dataclass class StreamEvent(text: str = "", done: bool = False, err: Exception | None = None)`。
-2. 定义 `class Provider(Protocol)`：`name` / `model`（property）；
-   `def stream(self, msgs: list[Message]) -> AsyncIterator[StreamEvent]: ...`。
-3. 实现 `def new_provider(cfg: ProviderConfig) -> Provider`：按 `cfg.protocol` 分派
-   `AnthropicProvider` / `OpenAIProvider`；未知协议抛 `ValueError`。
-   （适配器在 T7/T8 实现，先 import 占位，可在 `from .anthropic_provider import ...` 处暂用 `try/except` 让骨架可 import。）
+```python
+def render_skill_catalog(items: list[tuple[str, str]]) -> str: ...
+def render_active_skills(active: Mapping[str, str]) -> str: ...
+def Agent.activate_skill(name: str, prompt_body: str) -> None: ...
+def Agent.clear_active_skills() -> None: ...
+def Agent.set_skill_catalog(catalog: str) -> None: ...
+```
 
-**验证：** `python -c "from Arkcode.llm import Provider, Message, StreamEvent, new_provider"` 不报错。
+- [x] **T4.1 写失败测试**：Catalog 只含 name/description，不含 SOP；Active Skills
+  按激活顺序输出且空集合不输出标题；重复激活覆盖正文；clear 清空；模拟一次 Agent run
+  中 iteration 1 调 LoadSkill 后，iteration 2 的 `Request.system.environment` 出现新 SOP。
 
-## T6: conversation 模块
-**文件：** `src/Arkcode/conversation.py`、`tests/test_conversation.py`
-**依赖：** T5
-**步骤：**
-1. 定义 `class Conversation`，内部 `self._messages: list[Message] = []`。
-2. 实现 `add_user(text)`、`add_assistant(text)`、`messages() -> list[Message]`（返回 `list(self._messages)` 副本）。
-3. 单测：连续 `add_user` / `add_assistant` 后 `messages()` 顺序与 role 正确。
+```python
+def test_active_skills_render_full_sop() -> None:
+    text = render_active_skills({"review": "Check bugs"})
+    assert "## Active Skills" in text
+    assert "### Skill: review" in text
+    assert "Check bugs" in text
+```
 
-**验证：** `pytest tests/test_conversation.py` 通过。
+- [x] **T4.2 运行失败测试**。
 
-## T7: anthropic 适配器
-**文件：** `src/Arkcode/llm/anthropic_provider.py`
-**依赖：** T5、T4
-**步骤：**
-1. `class AnthropicProvider`：`__init__(self, cfg)` 中 `self._client = anthropic.AsyncAnthropic(api_key=cfg.api_key, base_url=cfg.base_url or None)`；保存 `cfg.model` / `cfg.name` / `cfg.thinking`。
-2. `name` / `model` property 返回 `cfg.name` / `cfg.model`。
-3. `async def stream(self, msgs) -> AsyncIterator[StreamEvent]`：
-   - 把 `msgs` 转 `[{"role": m.role, "content": m.content} for m in msgs]`。
-   - `params = {"model": self._model, "max_tokens": 4096, "system": SYSTEM_PROMPT, "messages": [...]}`。
-   - 若 `self._thinking`，加 `thinking={"type": "enabled", "budget_tokens": 2048}`。
-   - `try: async with self._client.messages.stream(**params) as stream: async for event in stream:`
-     根据 `event.type` 判断：`content_block_delta` 且 `event.delta.type == "text_delta"` →
-     `yield StreamEvent(text=event.delta.text)`；`thinking_delta` 跳过；其他事件忽略。
-   - `else` 分支正常结束 → `yield StreamEvent(done=True)`。
-   - `except asyncio.CancelledError: raise`；其他 `except Exception as e: yield StreamEvent(err=e)`。
+```bash
+.venv/bin/pytest -q tests/test_prompt_skills.py tests/test_agent.py -k skill
+```
 
-**验证：** `python -c "from Arkcode.llm.anthropic_provider import AnthropicProvider"` 不报错；联调留到 T14；可写小脚本用假 key 触发错误，确认拿到 `err` 事件。
+- [x] **T4.3 实现动态 environment**：基础环境可在 run 开头采集，但 Catalog 与 Active
+  Skills 必须在每个 iteration 重新拼装；稳定 system 不含动态 Skill 正文。
 
-## T8: openai 适配器
-**文件：** `src/Arkcode/llm/openai_provider.py`
-**依赖：** T5、T4
-**步骤：**
-1. `class OpenAIProvider`：`__init__` 中 `self._client = openai.AsyncOpenAI(api_key=cfg.api_key, base_url=cfg.base_url or None)`；保存 `cfg.model` / `cfg.name`（`thinking` 忽略）。
-2. `name` / `model` property 同上。
-3. `async def stream(self, msgs) -> AsyncIterator[StreamEvent]`：
-   - 组装 `messages = [{"role": "system", "content": SYSTEM_PROMPT}] + [{"role": m.role, "content": m.content} for m in msgs]`。
-   - `try: stream = await self._client.chat.completions.create(model=self._model, messages=messages, stream=True)`。
-   - `async for chunk in stream: delta = chunk.choices[0].delta.content; if delta: yield StreamEvent(text=delta)`。
-   - 结束后 `yield StreamEvent(done=True)`。
-   - `except asyncio.CancelledError: raise`；其他 `except Exception as e: yield StreamEvent(err=e)`。
+- [x] **T4.4 验证 Prompt 与 Agent 回归**。
 
-**验证：** import 不报错；同 T7 的错误路径手测。
+```bash
+.venv/bin/pytest -q tests/test_prompt.py tests/test_prompt_skills.py tests/test_agent.py
+```
 
-## T9: TUI App 骨架
-**文件：** `src/Arkcode/tui/app.py`、`src/Arkcode/tui/__init__.py`
-**依赖：** T1、T2、T5、T6
-**步骤：**
-1. 定义 `class SessionState(Enum)`：`SELECTING` / `IDLE` / `STREAMING`。
-2. 定义 `class ArkCodeApp(App)`：构造参数 `providers: list[ProviderConfig]`；初始化 `state`、`provider: Provider | None`、`conv = Conversation()`、`cur_reply = ""`、`turn_start = 0.0`、`_stream_task = None`、`_timer = None`。
-3. `compose() -> ComposeResult`：yield `RichLog`（id="log"，wrap=True，markup=True）、`Static`（id="streaming"，初始空，用作动态区显示流式 cur_reply + "Imagining… (Ns)"）、`TextArea`（id="input"，single_line=False，用作输入框；用 CSS 给上边框 + `❯` 前缀）、`Static`（id="statusbar"）。`#prompt` 与 `#input` 的内容起始行必须一致，不给提示符额外顶部 padding。
-4. `on_mount(self)`：把 `prompt.render_banner(__version__, os.getcwd())` 写进 `RichLog`；
-   若 `len(self.providers) == 1`：`self.provider = new_provider(self.providers[0])`、`self.state = IDLE`、更新状态栏；
-   否则切 `SELECTING`（在 T11 接入 `OptionList`）。
-5. `BINDINGS = [("ctrl+c", "quit", "Quit")]`；`async def action_quit(self)`：若 `_stream_task` 存在则 `cancel()`，`self.exit()`。
-6. `def main()`（在 `cli.py` 中调用）：`ArkCodeApp(providers).run()`，使用默认标准全屏模式。
+---
 
-**验证：** `python -m Arkcode`（搭配最小合法配置）能进入界面，看到 banner + 空对话区 + 输入框 + 状态栏；`ruff check src/Arkcode/tui/app.py` 无告警。
+## T5：LoadSkillTool 与 Tool Registry 隔离视图
 
-## T10: TUI 流式接入与计时
-**文件：** `src/Arkcode/tui/stream.py`、`src/Arkcode/tui/app.py`
-**依赖：** T9、T5
-**步骤：**
-1. 在 `app.py` 给 `ArkCodeApp` 添加 `async def submit(self, text: str)`：
-   - 识别 `text.strip() == "/exit"` → `await self.action_quit()`。
-   - 否则：`self.conv.add_user(text)`；`self.query_one("#log", RichLog).write(user_block(text))`；
-     清空 TextArea；`self.cur_reply = ""`；`self.turn_start = time.monotonic()`；
-     `self.state = STREAMING`；`self._stream_task = asyncio.create_task(self._consume_stream())`；
-     `self._timer = self.set_interval(0.1, self._tick)`。
-2. 在 `stream.py`（或 app.py 内）实现 `async def _consume_stream(self)`：
-   ```python
-   try:
-       async for ev in self.provider.stream(self.conv.messages()):
-           if ev.err is not None:
-               self._finish_with_error(ev.err); return
-           if ev.text:
-               self.cur_reply += ev.text
-               self._refresh_streaming_view()
-           if ev.done:
-               self._finish_with_assistant(self.cur_reply); return
-   except asyncio.CancelledError:
-       raise
-   except Exception as e:
-       self._finish_with_error(e)
-   ```
-3. `_tick`：仅 `STREAMING` 时刷新 `#streaming` 上的 `Imagining… ({int(elapsed)}s)`。
-4. `_finish_with_assistant`：
-   - 用 `rich.markdown.Markdown(reply)` 渲染 → `RichLog.write(...)` 追加；
-   - `self.conv.add_assistant(reply)`；
-   - `self._timer.stop()`；`self._stream_task = None`；`self.state = IDLE`；清空 `#streaming`。
-5. `_finish_with_error`：`RichLog.write(error_block(e))`；同上回 IDLE。
-6. 在 `app.py` 监听 `TextArea` 提交：默认 Enter 在 TextArea 是换行；用 binding `("enter", "submit", "Submit")` + 自定义检查 `if not alt: submit() else: 插入换行`（或反向使用 `shift+enter` 换行 + Enter 提交，按 spec 用 Alt+Enter 换行）。
+**文件：**
 
-**验证：** 配真实 key 后跑通一轮：能看到 "Imagining… (Ns)" 计时；流式逐字；done 后看到 markdown 渲染追加到 RichLog。
+- 新建 `src/Arkcode/tool/load_skill.py`
+- 修改 `src/Arkcode/tool/registry.py`
+- 修改 `src/Arkcode/tool/__init__.py`
+- 新建 `tests/test_skill_tools.py`
+- 修改 `tests/test_tool.py`
 
-## T11: TUI provider 选择
-**文件：** `src/Arkcode/tui/select.py`
-**依赖：** T9、T2、T5
-**步骤：**
-1. 当 `state == SELECTING` 时，`compose` 中再 yield 一个 `OptionList`，列出 `f"{p.name} ({p.model})"` 每项。
-2. 监听 `on_option_list_option_selected`：取出对应 `ProviderConfig` → `self.provider = new_provider(cfg)` → 更新状态栏 → 隐藏/移除 `OptionList` → 切 `IDLE`。
-3. 进入 `SELECTING` 时把 `TextArea` / `RichLog` 隐藏，仅显示 list；切回 `IDLE` 时反过来。
+**依赖：** T2、T4
 
-**验证：** 用 2 条 provider 配置启动应出现选择列表（在 T14 端到端验证）。
+**产出接口：**
 
-## T12: TUI View 拼装与渲染
-**文件：** `src/Arkcode/tui/view.py`
-**依赖：** T9、T4、T10
-**步骤：**
-1. banner 在 `on_mount` 时写入 `RichLog`（一次性），不在每帧渲染中重绘。
-2. 动态区只有 `#streaming`（流式时显示 `● {cur_reply}\nImagining… (Ns)`）+ 输入框 + 状态栏。
-3. 状态栏：用 Rich 的 `Text`/`Table.grid` 左 `provider.name`、右 `provider.model`，两端对齐；
-   写到 `#statusbar: Static`。
-4. 完成块（追加到 `RichLog`）：
-   - `user_block(text)` = `Text("● " + text, style="bold")` 或纯文本（无 You/ArkCode 文字标签）；
-   - `render_markdown(reply)` = 一个 `Group(Text("● "), Markdown(reply))` 之类的组合；
-   - 都无 You/ArkCode 文字标签。
-5. 错误样式：`error_block(err)` 用红色 lipgloss 等价的 `Text("● " + str(err), style="bold red")`。
-6. 长行：Textual + Rich 默认按宽度软换行；CSS 设置 `#streaming: width: 1fr; height: auto;`，
-   `Markdown`/`RichLog` 用 `width: 1fr;` 自适应（N6）。
+```python
+class LoadSkillTool(Tool): ...
+def Registry.without(names: Collection[str]) -> Registry: ...
+```
 
-**验证：** 把工具栏、状态栏、错误样式截图比对；`ruff check src/Arkcode/tui/` 无告警。
+- [x] **T5.1 写失败测试**：工具名、schema、`read_only=True`、未初始化、非法 JSON、
+  unknown、成功激活、确认消息不含 SOP；`without({"LoadSkill"})` 保持顺序且不修改源
+  Registry。
 
-## T13: 入口装配
-**文件：** `src/Arkcode/cli.py`（替换 T1 占位）
-**依赖：** T2、T4、T9
-**步骤：**
-1. `def main() -> None`：
-   - `try: cfg = config.load(".env")`；`except ConfigError as e: print(e, file=sys.stderr); sys.exit(1)`。
-   - 可选：先 `print(prompt.render_banner(__version__, os.getcwd()))`，或交给 TUI 在 `on_mount` 写 `RichLog`（二选一保持一致；本项目用后者）。
-   - `ArkCodeApp(cfg.providers).run()`；若抛非 KeyboardInterrupt 异常，`print(...)` 并 `sys.exit(1)`。
+```python
+@pytest.mark.asyncio
+async def test_load_skill_activates_without_returning_body() -> None:
+    result = await tool.execute('{"name":"review"}')
+    agent.activate_skill.assert_called_once_with("review", "secret SOP")
+    assert "secret SOP" not in result.content
+```
 
-**验证：** `python -m Arkcode` 在合法配置下能启动 TUI；缺配置时打印可读错误并退出码非零。
+- [x] **T5.2 运行失败测试**。
 
-## T14: 端到端联调
-**文件：** 无（运行验证）
-**依赖：** T1–T13
-**步骤：**
-1. 用真实 anthropic 配置（`thinking: true`）跑：多轮对话、流式逐字、Imagining 计时、done 后 markdown 定型、思考内容不出现。
-2. 用 openai 协议配置跑：同样多轮 + 流式。
-3. 在 `.env` 中通过 `ARKCODE_PROVIDERS` 配两条 provider：启动出现与声明顺序一致的
-   选择列表，选定后状态栏正确。
-4. 故意用错误 key：错误在对话区显示且不退出，可继续。
-5. `/exit` 与 Ctrl+C：安全退出、终端无残留（终端 raw mode 由 Textual 自动还原）。
-6. 在 80×24 终端验证全屏布局：启动前 shell 内容不与 TUI 重叠；banner、用户消息和助手
-   回复可见；`❯` 与输入文字同一行；输入区与状态栏不重叠；退出后恢复原 shell。
+```bash
+.venv/bin/pytest -q tests/test_skill_tools.py tests/test_tool.py -k 'skill or without'
+```
 
-7. 先设置与 `.env` 同名但不同值的系统环境变量，确认 `.env` 值生效且任何输出不含 key。
+- [x] **T5.3 实现工具与隔离视图**：严格复用当前 `Tool.execute(args: str) -> Result`
+  协议，不引入 `category/params_model` 第二套接口。
 
-**验证：** 逐条对照 `checklist.md` 记录证据；运行 `pytest`、`ruff check .`、
-`ruff format --check .`、`mypy src/Arkcode`。
+- [x] **T5.4 验证**。
 
-## T15: 修复 80×24 TUI 重叠与会话不可见
-**文件：** `src/Arkcode/cli.py`、`src/Arkcode/tui/app.py`、`tests/test_cli.py`、`tests/test_tui.py`
-**依赖：** T9、T12、T13
-**步骤：**
-1. 在 `tests/test_cli.py` 增加启动模式回归测试，验证 CLI 不启用 `inline` /
-   `inline_no_clear`。
-2. 在 `tests/test_tui.py` 以 80×24 运行真实 Textual 布局，断言 banner 已写入可视对话区，
-   `#prompt` 与 `#input` 内容区域起始行一致，输入区与状态栏不相交。
-3. 先运行定向测试并确认因现有 inline 参数和提示符顶部 padding 失败。
-4. CLI 改用 `ArkCodeApp(...).run()` 默认全屏模式；移除 `#prompt` 的额外顶部 padding。
-5. 运行定向测试、全量测试、ruff、格式和 mypy 检查。
+```bash
+.venv/bin/pytest -q tests/test_skill_tools.py tests/test_tool.py
+```
 
-**验证：** 80×24 自动化布局测试通过；真实终端启动截图无重叠且会话内容可见；
-`/exit` 与 Ctrl+C 后 shell 和终端输入状态恢复。
+---
+
+## T6：SkillExecutor inline 路径
+
+**文件：**
+
+- 新建 `src/Arkcode/skills/executor.py`
+- 修改 `src/Arkcode/skills/__init__.py`
+- 新建 `tests/test_skills_executor.py`
+
+**依赖：** T1、T4、T5
+
+**产出接口：**
+
+```python
+SYSTEM_TOOL_NAMES = frozenset({"LoadSkill"})
+def SkillExecutor.execute_inline(skill: SkillMeta, args: str) -> None: ...
+```
+
+- [x] **T6.1 写失败测试**：有/无 `$ARGUMENTS`、多占位符；只调用
+  `agent.activate_skill`，不调用 Provider，不修改 Conversation。
+
+```python
+def test_execute_inline_only_activates() -> None:
+    executor.execute_inline(skill_with_arguments, "src")
+    agent.activate_skill.assert_called_once_with("review", "Review src")
+    assert conversation.messages() == []
+```
+
+- [x] **T6.2 运行失败测试**。
+
+```bash
+.venv/bin/pytest -q tests/test_skills_executor.py -k inline
+```
+
+- [x] **T6.3 实现 inline 最小路径**。
+
+- [x] **T6.4 验证**。
+
+```bash
+.venv/bin/pytest -q tests/test_skills_executor.py -k inline
+```
+
+---
+
+## T7：SkillExecutor fork 路径
+
+**文件：**
+
+- 修改 `src/Arkcode/skills/executor.py`
+- 修改 `tests/test_skills_executor.py`
+
+**依赖：** T5、T6
+
+**产出接口：**
+
+```python
+async def SkillExecutor.execute_fork(skill: SkillMeta, args: str) -> str: ...
+```
+
+- [x] **T7.1 写失败测试**：none 空历史；recent 只取最近 5 条 user/assistant；full
+  先摘要；fork Conversation 与 Runtime 不同于主对象；model override 使用替换后的配置；
+  registry 排除 LoadSkill；累计 text 到 done；普通异常转错误文本；CancelledError 上抛。
+
+```python
+@pytest.mark.asyncio
+async def test_fork_none_does_not_modify_main_conversation() -> None:
+    before = main_conversation.messages()
+    result = await executor.execute_fork(fork_skill(context="none"), "target")
+    assert result == "fork result"
+    assert main_conversation.messages() == before
+```
+
+- [x] **T7.2 运行失败测试**。
+
+```bash
+.venv/bin/pytest -q tests/test_skills_executor.py -k fork
+```
+
+- [x] **T7.3 实现 fork**：使用当前 `Conversation`、`SessionRuntime`、`Agent.run` 和
+  `AgentEvent`，不引入第二套会话或事件抽象。
+
+- [x] **T7.4 验证**。
+
+```bash
+.venv/bin/pytest -q tests/test_skills_executor.py
+```
+
+---
+
+## T8：`/skill` 与动态 Skill 命令
+
+**文件：**
+
+- 新建 `src/Arkcode/command/skills.py`
+- 修改 `src/Arkcode/command/__init__.py`
+- 修改 `src/Arkcode/command/ui.py`
+- 新建 `tests/test_command_skills.py`
+
+**依赖：** T2、T3、T6、T7
+
+**产出接口：**
+
+```python
+def register_skill_management(registry: Registry, loader: SkillLoader) -> None: ...
+def register_skill_commands(
+    registry: Registry,
+    loader: SkillLoader,
+    executor: SkillExecutor,
+) -> None: ...
+```
+
+- [x] **T8.1 写失败测试**：`/skill`、list、info、reload、非法参数；source/path/
+  directory 可观察；动态描述含 `[skill]`；inline 激活后触发主 Agent；fork 创建后台任务
+  并回流；Skill 覆盖内置 `/review`。
+
+```python
+@pytest.mark.asyncio
+async def test_inline_skill_command_uses_hot_reloaded_body() -> None:
+    command = registry.lookup("commit")
+    await command.handler(ui, "src")
+    executor.execute_inline.assert_called_once()
+    ui.inject_and_send.assert_called_once_with("/commit", "/commit src")
+```
+
+- [x] **T8.2 运行失败测试**。
+
+```bash
+.venv/bin/pytest -q tests/test_command_skills.py
+```
+
+- [x] **T8.3 扩展 UI/NopUI 并实现命令**：管理命令不触发 LLM；动态 handler 每次先
+  `loader.get`；fork task 内部捕获普通异常并回流。
+
+- [x] **T8.4 验证命令回归**。
+
+```bash
+.venv/bin/pytest -q tests/test_command_skills.py tests/test_command_builtins.py \
+  tests/test_command_complete.py
+```
+
+---
+
+## T9：TUI 生命周期、Catalog、clear 与 fork 回流
+
+**文件：**
+
+- 修改 `src/Arkcode/tui/app.py`
+- 修改 `src/Arkcode/tui/commands.py`
+- 修改 `src/Arkcode/cli.py`
+- 修改 `tests/test_tui.py`
+
+**依赖：** T2、T4-T8
+
+**产出行为：** App 启动加载 Catalog；Provider 激活后组装 Agent/Executor；reload
+原子重建命令与 Catalog；clear 清 Active Skills；退出取消 fork tasks。
+
+- [x] **T9.1 写失败测试**：App 构造并注册 LoadSkillTool；Catalog 只注入 name/desc；
+  `/help` 和补全出现 Skill；reload 新增/删除即时更新；inline 发送触发；fork 结果仅新增
+  一条 `<system-reminder>` 回流消息；clear 成功后清 active，失败时保留；unmount 取消任务。
+
+```python
+@pytest.mark.asyncio
+async def test_clear_removes_active_skills_after_new_session(monkeypatch) -> None:
+    app.agent.activate_skill("review", "SOP")
+    await app.submit("/clear")
+    assert app.agent.active_skills == {}
+    assert app.skill_loader.get_catalog()
+```
+
+- [x] **T9.2 运行失败测试**。
+
+```bash
+.venv/bin/pytest -q tests/test_tui.py -k skill
+```
+
+- [x] **T9.3 实现生命周期**：Loader 在 App 初始化；LoadSkillTool 在 Agent 前注册；
+  Provider 激活后注入 Agent 和 Executor；Registry 原地重建。InstallSkillTool 留到 T11
+  接入。
+
+- [x] **T9.4 验证 TUI 与既有 Slash 回归**。
+
+```bash
+.venv/bin/pytest -q tests/test_tui.py tests/test_command_skills.py
+```
+
+---
+
+## T10：远程安装解析与安全下载
+
+**文件：**
+
+- 新建 `src/Arkcode/skills/install.py`
+- 修改 `src/Arkcode/skills/__init__.py`
+- 修改 `pyproject.toml`
+- 新建 `tests/test_skills_install.py`
+
+**依赖：** T1
+
+**产出接口：**
+
+```python
+MAX_FILE_SIZE = 1024 * 1024
+MAX_TOTAL_SIZE = 8 * 1024 * 1024
+MAX_FILE_COUNT = 64
+MAX_RECURSION_DEPTH = 4
+
+@dataclass(frozen=True, slots=True)
+class SkillSource: ...
+def parse_skill_url(url: str) -> SkillSource: ...
+async def install_skill(source: SkillSource, install_root: Path) -> str: ...
+```
+
+- [x] **T10.1 写失败测试**：三种 URL；HTTP/未知 host/缺路径拒绝；mock
+  `httpx.MockTransport` 覆盖目录递归、raw 单文件、base64 错误、API 错误、四项限额、
+  路径逃逸、缺 SKILL.md、parse 失败、目标存在、成功 rename 和失败 staging 清理。
+
+```python
+def test_parse_github_tree_url() -> None:
+    source = parse_skill_url(
+        "https://github.com/acme/skills/tree/main/review"
+    )
+    assert (source.owner, source.repo, source.ref, source.path) == (
+        "acme", "skills", "main", "review"
+    )
+```
+
+- [x] **T10.2 运行失败测试**。
+
+```bash
+.venv/bin/pytest -q tests/test_skills_install.py
+```
+
+- [x] **T10.3 添加 `httpx>=0.27` 并实现安装器**：网络只访问 GitHub API；写入前
+  校验每个节点；staging 与目标同父目录；目标已存在不覆盖。
+
+- [x] **T10.4 验证**。
+
+```bash
+.venv/bin/pytest -q tests/test_skills_install.py
+.venv/bin/ruff check src/Arkcode/skills/install.py tests/test_skills_install.py
+```
+
+---
+
+## T11：InstallSkillTool 与安装后热注册
+
+**文件：**
+
+- 新建 `src/Arkcode/tool/install_skill.py`
+- 修改 `src/Arkcode/tool/__init__.py`
+- 修改 `src/Arkcode/tui/app.py`
+- 修改 `tests/test_skill_tools.py`
+- 修改 `tests/test_tui.py`
+
+**依赖：** T9、T10
+
+**产出接口：**
+
+```python
+class InstallSkillTool(Tool):
+    read_only = False
+```
+
+- [x] **T11.1 写失败测试**：name/schema/write 分类、非法 JSON/URL、安装失败；成功时
+  `loader.reload()` 与 `on_installed()` 各一次；TUI 回调更新 `/help`、补全和 Agent Catalog。
+
+```python
+@pytest.mark.asyncio
+async def test_install_success_reloads_and_notifies() -> None:
+    result = await tool.execute('{"url":"https://skills.sh/acme/repo/review"}')
+    loader.reload.assert_called_once_with()
+    on_installed.assert_called_once_with()
+    assert result.is_error is False
+```
+
+- [x] **T11.2 运行失败测试**。
+
+```bash
+.venv/bin/pytest -q tests/test_skill_tools.py tests/test_tui.py -k install_skill
+```
+
+- [x] **T11.3 实现 Tool 与 callback**：不得把网络或写盘标记为 read-only；callback
+  失败返回可观察错误，不报告假成功。
+
+- [x] **T11.4 验证**。
+
+```bash
+.venv/bin/pytest -q tests/test_skill_tools.py tests/test_tui.py -k skill
+```
+
+---
+
+## T12：公共导出、类型检查与全量回归
+
+**文件：**
+
+- 修改 `src/Arkcode/skills/__init__.py`
+- 修改 `src/Arkcode/tool/__init__.py`
+- 修改 `src/Arkcode/command/__init__.py`
+- 修改 `tests/test_package_facades.py`
+
+**依赖：** T1-T11
+
+- [x] **T12.1 写公共导入测试**：从三个 package facade 导入新公开类型；确认唯一公开
+  的 Skill 元数据类型名是 `SkillMeta`。
+
+```python
+def test_skill_public_facade() -> None:
+    from Arkcode.skills import SkillExecutor, SkillLoader, SkillMeta
+    assert SkillMeta.__name__ == "SkillMeta"
+```
+
+- [x] **T12.2 运行相关完整测试**。
+
+```bash
+.venv/bin/pytest -q tests/test_skills_parser.py tests/test_skills_loader.py \
+  tests/test_skills_executor.py tests/test_skills_install.py \
+  tests/test_skill_tools.py tests/test_command_skills.py \
+  tests/test_prompt_skills.py tests/test_agent.py tests/test_tui.py
+```
+
+- [x] **T12.3 修复本功能引入的回归，不改动无关行为**。
+
+- [x] **T12.4 执行质量门禁**。
+
+```bash
+.venv/bin/python -m compileall -q src/Arkcode
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+.venv/bin/mypy src/Arkcode
+.venv/bin/pytest -q
+git diff --check
+```
+
+预期：Skill 相关测试、compileall、ruff、format、mypy 全绿；若全量 pytest 存在任务前
+已确认的无关基线失败，必须记录原始失败与对比证据，不得标记“全部通过”。
+
+---
+
+## T13：真实 TUI 端到端验收与文档收口
+
+**文件：**
+
+- 修改 `checklist.md`
+- 如项目采用课程文档目录，同步 `docs/skills/`；否则以根目录四份文档为唯一权威来源
+
+**依赖：** T1-T12
+
+- [ ] **T13.1 创建隔离测试 workspace**：写入 inline、fork、bad 三个 Skill；不得污染
+  仓库已有 `.Arkcode/skills` 或用户目录。
+
+```bash
+workspace="$(mktemp -d /tmp/arkcode-skills-e2e.XXXXXX)"
+```
+
+- [ ] **T13.2 在 tmux 启动真实 ArkCode**：使用合法测试配置，捕获启动页、`/help`、
+  `/skill list/info`、补全菜单证据。
+
+- [ ] **T13.3 验证 inline**：`/test-skill first` 后观察 Agent 请求 environment 含替换后的
+  SOP；编辑文件后不重启，再执行并看到新正文。
+
+- [ ] **T13.4 验证 LoadSkill**：自然语言触发工具，确认无权限弹窗，下一 iteration 出现
+  Active Skills，tool result 不包含完整 SOP。
+
+- [ ] **T13.5 验证 fork**：确认独立执行、主历史不含子过程，只新增最终
+  `<system-reminder>` 回流结果。
+
+- [ ] **T13.6 验证 clear/reload/bad file**：clear 后 Active Skills 消失但 Catalog 保留；
+  reload 更新命令；坏 Skill 只 warning。
+
+- [ ] **T13.7 验证安装权限和离线 mock 安装**：InstallSkill 出现写操作审批；安装成功后
+  `/help` 与补全即时出现新 Skill。
+
+- [x] **T13.8 按 checklist 逐项写证据并勾选**：tmux 不可用或无真实 Provider 凭据时，
+  对应项保持未勾选并明确说明阻塞，不得用推断代替实际结果。
+
+---
 
 ## 执行顺序
+
+```text
+T1 -> T2 ---------------------> T8 -> T9 -----> T11 -> T12 -> T13
+ |                              ^     ^          ^
+ +-> T4 -> T5 -> T6 -> T7 -----+-----+          |
+                                              T10
+
+T3 --------------------------------> T8
 ```
-T1 ─┬─ T2 ─┬─ T3
-    │      └─ T5 ─┬─ T6
-    │             ├─ T7
-    │             └─ T8
-    ├─ T4
-    └─ T9 ─┬─ T10
-           ├─ T11
-           └─ T12
-T2,T4,T9 ─ T13
-T1..T13 ─ T14
+
+T3 与 T1-T2 可独立推进；T10 可在 T9 之前完成，但 T11 必须等待 T9 与 T10。
+
+## 提交检查点
+
+每个任务验证通过后，只暂存该任务文件并提交；不得顺带提交用户已有的无关改动：
+
+```text
+T1  feat(skills): add skill metadata parser
+T2  feat(skills): add layered skill loader
+T3  feat(commands): support parameterized slash commands
+T4  feat(agent): inject active skills into environment
+T5  feat(tools): add load skill tool
+T6  feat(skills): add inline skill execution
+T7  feat(skills): add isolated fork execution
+T8  feat(commands): register skill slash commands
+T9  feat(tui): integrate skill lifecycle
+T10 feat(skills): add secure remote installer
+T11 feat(tools): integrate install skill tool
+T12 test(skills): close skill system regression suite
+T13 docs(skills): record end-to-end acceptance
 ```
-（T4 可与 T2/T5 并行；T7、T8 可并行；T10/T11/T12 在 T9 后可并行推进。）
+
+## 进度
+
+- [x] T1：SkillMeta 与 Parser
+- [x] T2：SkillLoader
+- [x] T3：Slash 参数与 Registry 覆盖
+- [x] T4：Prompt 与 Agent 注入
+- [x] T5：LoadSkillTool 与 Registry 隔离
+- [x] T6：inline Executor
+- [x] T7：fork Executor
+- [x] T8：Skill Commands
+- [x] T9：TUI 生命周期与回流
+- [x] T10：安全远程安装
+- [x] T11：InstallSkillTool 与热注册
+- [x] T12：全量质量门禁（384 passed；1 个已记录的无关 MCP 文档基线失败）
+- [ ] T13：端到端验收

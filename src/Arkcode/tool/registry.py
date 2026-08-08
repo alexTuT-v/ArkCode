@@ -1,6 +1,7 @@
 """工具注册、发现和受控执行。"""
 
 import asyncio
+from collections.abc import Collection
 
 from .base import Result, Tool, ToolDefinition
 
@@ -23,6 +24,16 @@ class Registry:
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
+
+    def without(self, names: Collection[str]) -> "Registry":
+        """返回排除指定工具的独立注册表，并保留其余工具顺序。"""
+
+        excluded = set(names)
+        filtered = Registry()
+        for name in self._order:
+            if name not in excluded:
+                filtered.register(self._tools[name])
+        return filtered
 
     def count(self) -> int:
         return len(self._tools)

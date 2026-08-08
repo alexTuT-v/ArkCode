@@ -17,7 +17,7 @@ class Kind(Enum):
     PROMPT = "prompt"
 
 
-Handler = Callable[["UI"], Awaitable[None]]
+Handler = Callable[["UI", str], Awaitable[None]]
 
 
 @dataclass(slots=True)
