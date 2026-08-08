@@ -16,6 +16,8 @@ from textual.timer import Timer
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
 from ..agent import Agent, ApprovalRequest, SessionRuntime
+from ..command import Registry as CommandRegistry
+from ..command import register_builtins
 from ..compact import (
     CompactCircuitBreaker,
     ContentReplacementState,
@@ -31,7 +33,8 @@ from ..permission import Engine, Mode, Outcome
 from ..prompt import render_banner
 from ..session import Writer
 from ..tool import Registry
-from .commands import dispatch_command
+from .commands import dispatch_slash
+from .complete import CompletionMenu
 from .resume import SessionItem, begin_resume, do_resume_session, handle_resume_key
 from .select import provider_options
 from .stream import StreamControllerMixin, ToolDisplay
@@ -153,6 +156,13 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         padding: 0 1;
         background: $panel;
     }
+
+    #completion {
+        width: 1fr;
+        height: auto;
+        max-height: 10;
+        padding: 0 4;
+    }
     """
 
     BINDINGS = [
@@ -180,6 +190,9 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         self._version = version
         # Textual 的 App 已占用 ``_registry`` 管理 DOM 节点。
         self._tool_registry = registry
+        self.cmd_registry = CommandRegistry()
+        register_builtins(self.cmd_registry)
+        self.completion = CompletionMenu()
         self.engine = engine
         self.runtime = runtime or SessionRuntime(
             replacement=ContentReplacementState(),
@@ -241,6 +254,7 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
                 soft_wrap=True,
                 placeholder="Send a message...",
             )
+        yield Static("", id="completion")
         yield Static("", id="statusbar")
 
     def on_mount(self) -> None:
@@ -320,6 +334,13 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         self._activate_provider(self.providers[event.option_index])
 
     async def on_message_input_submitted(self, event: MessageInput.Submitted) -> None:
+        if self.state is SessionState.IDLE and self.completion.active:
+            selected = self.completion.selected()
+            if selected is not None:
+                input_box = self.query_one("#input", MessageInput)
+                input_box.text = "/" + selected.name
+                await self.submit(input_box.text)
+                return
         await self.submit(event.text)
 
     async def on_key(self, event: Key) -> None:
@@ -329,6 +350,8 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
             ):
                 await handle_resume_key(self, event)
             return
+        if self.state is SessionState.IDLE and await self._handle_completion_key(event):
+            return
         if self.state is not SessionState.APPROVING:
             return
         if event.key in {"escape", "ctrl+c"}:
@@ -337,42 +360,81 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         event.stop()
         self.update_approving(event.key)
 
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if event.text_area.id != "input":
+            return
+        self.completion.update(event.text_area.text, self.cmd_registry)
+        self._render_completion()
+
+    def _render_completion(self) -> None:
+        self.query_one("#completion", Static).update(
+            self.completion.render(max(1, self.size.width - 8))
+        )
+
+    async def _handle_completion_key(self, event: Key) -> bool:
+        if not self.completion.active:
+            return False
+        if event.key == "up":
+            self.completion.move_up()
+        elif event.key == "down":
+            self.completion.move_down()
+        elif event.key == "escape":
+            self.completion.hide()
+        elif event.key in {"enter", "tab"}:
+            selected = self.completion.selected()
+            if selected is not None:
+                input_box = self.query_one("#input", MessageInput)
+                input_box.text = "/" + selected.name
+                await self.submit(input_box.text)
+            elif event.key == "enter":
+                input_box = self.query_one("#input", MessageInput)
+                await self.submit(input_box.text)
+            else:
+                self.completion.hide()
+        else:
+            return False
+        event.prevent_default()
+        event.stop()
+        self._render_completion()
+        return True
+
+    async def dispatch_slash(self, text: str) -> bool:
+        return await dispatch_slash(self, text)
+
     def begin_resume(self) -> None:
         begin_resume(self)
 
     async def submit(self, text: str) -> None:
         """提交一轮用户输入；流式期间忽略新的提交。"""
 
-        if self.state is not SessionState.IDLE:
-            if text.strip() == "/resume" and self.state in {
-                SessionState.STREAMING,
-                SessionState.APPROVING,
-            }:
-                self.query_one("#log", RichLog).write(
-                    Text("请等待当前任务完成", style="dim")
-                )
-            return
         command = text.strip()
         if not command:
             return
 
-        input_box = self.query_one("#input", MessageInput)
-        input_box.clear()
-        handler, handled = dispatch_command(command)
-        if handled:
-            self._pending_command = command
-            assert handler is not None
-            await handler(self)
+        if await self.dispatch_slash(command):
+            input_box = self.query_one("#input", MessageInput)
+            input_box.clear()
+            self.completion.hide()
+            self._render_completion()
+            return
+        if self.state is not SessionState.IDLE:
             return
 
+        input_box = self.query_one("#input", MessageInput)
+        input_box.clear()
         await self._submit_user_text(text)
 
-    async def _submit_user_text(self, user_text: str) -> None:
+    async def _submit_user_text(
+        self,
+        user_text: str,
+        *,
+        display_text: str | None = None,
+    ) -> None:
         """把普通用户文本写入会话并启动 Agent 消费任务。"""
 
         input_box = self.query_one("#input", MessageInput)
         self.conv.add_user(user_text)
-        self.query_one("#log", RichLog).write(user_block(user_text))
+        self.query_one("#log", RichLog).write(user_block(display_text or user_text))
         input_box.disabled = True
         self.cur_reply = ""
         self.cur_thinking = ""

@@ -18,6 +18,7 @@ from Arkcode.agent import (
     CompactEvent,
     CompactPhase,
 )
+from Arkcode.command import Command, Kind
 from Arkcode.config import ProviderConfig
 from Arkcode.llm import (
     Message,
@@ -34,7 +35,7 @@ from Arkcode.llm import (
 from Arkcode.mcp import McpStatus
 from Arkcode.permission import Mode, Outcome, new_engine
 from Arkcode.prompt import EXECUTE_DIRECTIVE, plan_reminder
-from Arkcode.session import Writer
+from Arkcode.session import Writer, list_sessions
 from Arkcode.tool import Registry, Result, new_default_registry
 from Arkcode.tui.app import ArkCodeApp, MessageInput, SessionState
 from Arkcode.tui.stream import ToolDisplay
@@ -367,6 +368,202 @@ async def test_resume_command_is_rejected_while_streaming(
         assert "请等待当前任务完成" in log_text(app.query_one("#log", RichLog))
         release.set()
         await wait_until_idle(pilot, app)
+
+
+@pytest.mark.asyncio
+async def test_slash_help_case_insensitive_and_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert await app.dispatch_slash("/Help") is True
+        output = log_text(app.query_one("#log", RichLog))
+
+        assert all(
+            f"/{name}" in output
+            for name in (
+                "clear",
+                "compact",
+                "do",
+                "exit",
+                "help",
+                "memory",
+                "permission",
+                "plan",
+                "resume",
+                "review",
+                "session",
+                "status",
+            )
+        )
+        assert provider.received == []
+        assert app.conv.messages() == []
+
+
+@pytest.mark.asyncio
+async def test_slash_review_is_persisted_as_user_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([TextDelta("reviewed"), end()])
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("/review")
+        await wait_until_idle(pilot, app)
+
+        assert "审查" in provider.received[0][0][0].content
+        assert app.conv.messages()[0].role == "user"
+
+
+@pytest.mark.asyncio
+async def test_slash_clear_starts_new_empty_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    runtime = app_module.SessionRuntime(
+        replacement=app_module.ContentReplacementState(),
+        recovery=app_module.RecoveryState(),
+        auto_tracking=app_module.CompactCircuitBreaker(),
+        session=app_module.new_session_context(str(tmp_path)),
+    )
+    old_id = runtime.session.session_id
+    app = ArkCodeApp(
+        [provider_config()],
+        "0.1.0",
+        new_default_registry(),
+        runtime=runtime,
+        writer=Writer(runtime.session.session_dir),
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.conv.add_user("old")
+        app.usage_in = 100
+        app.usage_out = 20
+        await app.submit("/clear")
+
+        assert app.runtime.session.session_id != old_id
+        assert app.conv.messages() == []
+        assert app.usage_in == app.usage_out == 0
+        assert Path(app.writer.path).is_file()
+        sessions = list_sessions(str(Path(app.writer.path).parents[1]))
+        assert old_id in {item.id for item in sessions}
+
+
+@pytest.mark.asyncio
+async def test_completion_filters_and_executes_highlighted_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        input_box = app.query_one("#input", TextArea)
+        input_box.text = "/"
+        await pilot.pause()
+        assert app.completion.active is True
+        assert len(app.completion.items) == 12
+
+        input_box.text = "/s"
+        await pilot.pause()
+        assert [item.name for item in app.completion.items] == ["session", "status"]
+
+        await pilot.press("down", "tab")
+        await pilot.pause()
+        output = log_text(app.query_one("#log", RichLog))
+        assert "ArkCode Status" in output
+        assert input_box.text == ""
+        assert app.completion.active is False
+
+
+@pytest.mark.asyncio
+async def test_completion_enter_executes_highlighted_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        input_box = app.query_one("#input", TextArea)
+        input_box.text = "/s"
+        await pilot.pause()
+
+        await pilot.press("down", "enter")
+        await pilot.pause()
+
+        assert "ArkCode Status" in log_text(app.query_one("#log", RichLog))
+        assert input_box.text == ""
+        assert app.completion.active is False
+
+
+@pytest.mark.asyncio
+async def test_local_commands_work_while_busy_and_ui_commands_are_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.state = SessionState.STREAMING
+        await app.submit("/status")
+        await app.submit("/clear")
+        output = log_text(app.query_one("#log", RichLog))
+
+        assert "ArkCode Status" in output
+        assert "请等待当前任务完成" in output
+
+
+@pytest.mark.asyncio
+async def test_command_handler_errors_are_rendered_without_escaping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(app_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async def broken(ui: object) -> None:
+        raise RuntimeError("command failed")
+
+    app.cmd_registry.register(Command("broken", "break", Kind.LOCAL, broken))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert await app.dispatch_slash("/broken") is True
+
+        assert "command failed" in log_text(app.query_one("#log", RichLog))
+
+
+def test_app_construction_fails_on_builtin_command_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = app_module.register_builtins
+
+    async def duplicate(ui: object) -> None:
+        return None
+
+    def conflicting(registry: object) -> None:
+        original(registry)  # type: ignore[arg-type]
+        registry.register(  # type: ignore[attr-defined]
+            Command("help", "duplicate", Kind.LOCAL, duplicate)
+        )
+
+    monkeypatch.setattr(app_module, "register_builtins", conflicting)
+
+    with pytest.raises(RuntimeError, match="help"):
+        make_app([provider_config()])
 
 
 def test_compact_notice_formats_auto_emergency_success_and_failure() -> None:

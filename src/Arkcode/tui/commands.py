@@ -1,26 +1,29 @@
-"""TUI 内置斜杠命令注册与压缩状态文案。"""
+"""Slash Command 与 Textual App 之间的适配层。"""
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+import os
 from typing import TYPE_CHECKING
 
 from rich.text import Text
 from textual.widgets import RichLog
 
 from ..agent import CompactEvent, CompactPhase
+from ..command import UI, Kind, parse
+from ..compact import new_session_context
+from ..conversation import Conversation
 from ..permission import Mode
-from ..prompt import EXECUTE_DIRECTIVE
+from ..session import Writer
+from .resume import begin_resume
+from .view import error_block
 
 if TYPE_CHECKING:
-    from .app import ArkCodeApp
+    from collections.abc import Awaitable
 
-CommandHandler = Callable[["ArkCodeApp"], Awaitable[None]]
+    from .app import ArkCodeApp
 
 
 def format_compact_notice(event: CompactEvent) -> str:
-    """把所有压缩路径格式化为统一、稳定的用户提示。"""
-
     if event.phase is CompactPhase.BEFORE_AUTO:
         return "正在压缩上下文..."
     if event.phase is CompactPhase.BEFORE_EMERGENCY:
@@ -30,79 +33,130 @@ def format_compact_notice(event: CompactEvent) -> str:
     return f"已压缩，token 从 {event.before} 降至 {event.after}"
 
 
-async def handle_exit(app: ArkCodeApp) -> None:
-    await app.action_quit()
+class AppUI(UI):
+    """把命令所需能力映射到 ArkCodeApp。"""
 
+    def __init__(self, app: ArkCodeApp) -> None:
+        self.app = app
+        self.tasks: list[Awaitable[None]] = []
 
-async def handle_plan(app: ArkCodeApp) -> None:
-    app.mode = Mode.PLAN
-    app.query_one("#log", RichLog).write(
-        Text("已进入计划模式（只读工具）", style="dim")
-    )
-    app._update_statusbar()
+    async def drain(self) -> None:
+        for task in self.tasks:
+            await task
 
+    def println(self, message: str) -> None:
+        self.app.query_one("#log", RichLog).write(Text(message, style="dim"))
 
-async def handle_do(app: ArkCodeApp) -> None:
-    app.mode = Mode.DEFAULT
-    app._update_statusbar()
-    await app._submit_user_text(EXECUTE_DIRECTIVE)
+    def error(self, message: str) -> None:
+        self.app.query_one("#log", RichLog).write(error_block(message, 0))
 
+    def mode(self) -> Mode:
+        return self.app.mode
 
-async def handle_compact(app: ArkCodeApp) -> None:
-    agent = app.agent
-    if agent is None:
-        app.query_one("#log", RichLog).write(
-            Text("压缩失败：尚未选择 provider", style="dim")
+    def set_mode(self, mode: Mode) -> None:
+        self.app.mode = mode
+        self.app._update_statusbar()
+
+    def inject_and_send(self, label: str, prompt: str) -> None:
+        self.tasks.append(self.app._submit_user_text(prompt, display_text=label))
+
+    def usage_in(self) -> int:
+        return self.app.usage_in
+
+    def usage_out(self) -> int:
+        return self.app.usage_out
+
+    def model_name(self) -> str:
+        return self.app.provider.model if self.app.provider is not None else ""
+
+    def cwd(self) -> str:
+        return os.getcwd()
+
+    def tool_count(self) -> int:
+        return self.app._tool_registry.count()
+
+    def memory_files(self) -> list[str]:
+        if self.app.mem_mgr is None:
+            return []
+        project, user = self.app.mem_mgr.list_files()
+        return project + user
+
+    def session_path(self) -> str:
+        return self.app.writer.path
+
+    def session_id(self) -> str:
+        return self.app.runtime.session.session_id
+
+    def quit(self) -> None:
+        self.app.writer.close()
+        self.app.exit()
+
+    def force_compact(self) -> None:
+        self.tasks.append(self._force_compact())
+
+    async def _force_compact(self) -> None:
+        agent = self.app.agent
+        if agent is None:
+            self.error("压缩失败：尚未选择 provider")
+            return
+        definitions = (
+            self.app._tool_registry.read_only_definitions()
+            if self.app.mode is Mode.PLAN
+            else self.app._tool_registry.definitions()
         )
-        return
-    definitions = (
-        app._tool_registry.read_only_definitions()
-        if app.mode is Mode.PLAN
-        else app._tool_registry.definitions()
-    )
+        try:
+            before, after = await agent.run_force_compact(self.app.conv, definitions)
+            event = CompactEvent(CompactPhase.AFTER_AUTO, before=before, after=after)
+        except Exception as error:
+            event = CompactEvent(CompactPhase.AFTER_AUTO, err=error)
+        self.println(format_compact_notice(event))
+
+    def open_resume_menu(self) -> None:
+        begin_resume(self.app)
+
+    def clear_and_new_session(self) -> None:
+        workspace = str(self.app.runtime.session.session_dir)
+        workspace = str(os.path.dirname(os.path.dirname(os.path.dirname(workspace))))
+        context = new_session_context(workspace)
+        writer = Writer(context.session_dir)
+        if self.app.provider is not None:
+            writer.set_model(self.app.provider.model)
+        conversation = Conversation(
+            on_append=writer.on_append,
+            on_replace=writer.on_replace,
+        )
+        previous = self.app.writer
+        self.app.writer = writer
+        self.app.conv = conversation
+        self.app.runtime.reset_for_new_session(context)
+        self.app.usage_in = 0
+        self.app.usage_out = 0
+        self.app.usage_cache_read = 0
+        self.app.usage_cache_creation = 0
+        self.app.query_one("#log", RichLog).clear()
+        previous.close()
+
+    def idle(self) -> bool:
+        return self.app.state is type(self.app.state).IDLE
+
+
+async def dispatch_slash(app: ArkCodeApp, text: str) -> bool:
+    name, is_slash = parse(text)
+    if not is_slash:
+        return False
+    command = app.cmd_registry.lookup(name)
+    ui = AppUI(app)
+    if command is None:
+        shown = text.strip()
+        prefix = f"未知命令: {shown}，" if shown not in {"", "/"} else "未知命令："
+        ui.println(prefix + "输入 /help 查看可用命令")
+        return True
+    if command.kind in {Kind.UI, Kind.PROMPT} and not ui.idle():
+        ui.error("请等待当前任务完成")
+        return True
     try:
-        before, after = await agent.run_force_compact(app.conv, definitions)
-        event = CompactEvent(
-            phase=CompactPhase.AFTER_AUTO,
-            before=before,
-            after=after,
-        )
+        await command.handler(ui)
+        await ui.drain()
     except Exception as error:
-        event = CompactEvent(phase=CompactPhase.AFTER_AUTO, err=error)
-    app.query_one("#log", RichLog).write(
-        Text(format_compact_notice(event), style="dim")
-    )
-
-
-async def handle_resume(app: ArkCodeApp) -> None:
-    if app.state is not type(app.state).IDLE:
-        app.query_one("#log", RichLog).write(Text("请等待当前任务完成", style="dim"))
-        return
-    app.begin_resume()
-
-
-async def handle_unknown(app: ArkCodeApp) -> None:
-    command = app._pending_command
-    app.query_one("#log", RichLog).write(
-        Text(
-            f"未知命令: {command}，可用命令: /exit /plan /do /compact /resume",
-            style="dim",
-        )
-    )
-
-
-BUILTIN_COMMANDS: dict[str, CommandHandler] = {
-    "/exit": handle_exit,
-    "/plan": handle_plan,
-    "/do": handle_do,
-    "/compact": handle_compact,
-    "/resume": handle_resume,
-}
-
-
-def dispatch_command(input_: str) -> tuple[CommandHandler | None, bool]:
-    """识别命令；普通文本返回未处理标记。"""
-
-    if not input_.startswith("/"):
-        return None, False
-    return BUILTIN_COMMANDS.get(input_, handle_unknown), True
+        ui.error(str(error))
+    return True

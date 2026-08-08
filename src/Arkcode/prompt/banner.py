@@ -23,6 +23,6 @@ def render_banner(version: str, cwd: str) -> Text:
             banner.append(character)
     banner.append(
         f"\nArk Code v{version}\nWorking directory: {cwd}\n"
-        "Ready — send a message to begin."
+        "Ready — send a message or enter /help for commands."
     )
     return banner

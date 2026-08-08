@@ -33,6 +33,7 @@ def test_banner_uses_compact_ark_code_pixel_logo() -> None:
     assert all(len(line) <= 80 for line in logo_lines)
     assert all("█" in line for line in logo_lines)
     assert "Ark Code v0.1.0" in text
+    assert "/help" in text
 
 
 def test_system_prompt_is_ordered_deterministic_and_reinforces_tools() -> None:

@@ -59,6 +59,18 @@ class Manager:
         self._provider = provider
         self._model = model
 
+    def list_files(self) -> tuple[list[str], list[str]]:
+        """列出项目级和用户级 Markdown 记忆文件。"""
+
+        def list_store(store: Store) -> list[str]:
+            try:
+                return sorted(path.name for path in store._dir.glob("*.md"))
+            except OSError:
+                logger.warning("读取记忆文件列表失败: %s", store._dir, exc_info=True)
+                return []
+
+        return list_store(self.project_store), list_store(self.user_store)
+
     @staticmethod
     def _action(value: dict[str, Any]) -> UpdateAction:
         return UpdateAction(

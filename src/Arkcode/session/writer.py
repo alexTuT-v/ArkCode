@@ -37,6 +37,7 @@ class Writer:
         directory = Path(session_dir)
         directory.mkdir(parents=True, exist_ok=True)
         self._path = directory / "conversation.jsonl"
+        self.path = str(self._path.resolve())
         self._file: BinaryIO = self._path.open("ab")
         self._lock = threading.Lock()
         self._model = ""
