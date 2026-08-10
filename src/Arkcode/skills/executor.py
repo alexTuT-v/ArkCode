@@ -1,22 +1,20 @@
 """Skill inline 与 fork 两种执行路径。"""
 
 import asyncio
-from dataclasses import replace
 from pathlib import Path
 
-from ..agent import Agent, SessionRuntime
-from ..compact import (
+from ..agents import Agent, SessionRuntime
+from ..config import ProviderConfig, effective_context_window
+from ..context import (
     CompactCircuitBreaker,
-    ContentReplacementState,
     RecoveryState,
     new_session_context,
 )
-from ..compact.summary_prompt import build_summary_prompt, extract_summary
-from ..config import ProviderConfig, effective_context_window
-from ..conversation import Conversation
+from ..context.prompts import build_summary_prompt, extract_summary
+from ..conversations import Conversation
 from ..llm import Request, StreamError, TextDelta, new_provider
-from ..permission import Engine, Mode
-from ..tool.registry import Registry
+from ..permissions import Engine, Mode
+from ..tools.registry import Registry
 from .parser import SkillMeta, substitute_arguments
 
 SYSTEM_TOOL_NAMES = frozenset({"LoadSkill"})
@@ -62,7 +60,6 @@ class SkillExecutor:
 
     def _new_runtime(self, config: ProviderConfig) -> SessionRuntime:
         return SessionRuntime(
-            replacement=ContentReplacementState(),
             recovery=RecoveryState(),
             auto_tracking=CompactCircuitBreaker(),
             session=new_session_context(str(self._work_dir)),
@@ -73,7 +70,7 @@ class SkillExecutor:
         try:
             rendered = substitute_arguments(skill.prompt_body, args)
             config = (
-                replace(self._provider_config, model=skill.model)
+                self._provider_config.model_copy(update={"model": skill.model})
                 if skill.model
                 else self._provider_config
             )

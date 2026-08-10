@@ -15,7 +15,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from .config import Config, ServerConfig
-from .tool import CallerSession, McpTool, adapt_tool
+from .tool_adapter import CallerSession, McpTool, adapt_tool
 
 _http_module = importlib.import_module("mcp.client.streamable_http")
 streamable_http_client: Any = getattr(_http_module, "streamable_http_client", None)
@@ -32,6 +32,7 @@ close_timeout: float = 5.0
 class _Session:
     name: str
     session: Any
+    mcp_instructions: str = ""
 
 
 @dataclass(frozen=True)
@@ -47,17 +48,101 @@ class McpStatus:
         return self.configured_servers - self.connected_servers
 
 
+@dataclass(frozen=True)
+class McpServerStatus:
+    """单个 MCP server 的运行时状态。"""
+
+    name: str
+    tool_count: int
+    connected: bool
+    error: str | None = None
+
+
 class Manager:
     """持有启动成功的会话和它们暴露的工具。"""
 
     def __init__(self, configured_servers: int = 0) -> None:
         self._lock = asyncio.Lock()
         self._configured_servers = configured_servers
+        self._configs: dict[str, ServerConfig] = {}
+        self._version = ""
         self._sessions: list[_Session] = []
         self._tools: list[McpTool] = []
         self._tasks: list[asyncio.Task[None]] = []
+        self._failures: dict[str, str] = {}
         self._stop = asyncio.Event()
         self._closed = False
+
+    def get_client(self, name: str) -> Any | None:
+        """返回已连接会话；未连接时返回 None（调用方可触发重连）。"""
+
+        for session in self._sessions:
+            if session.name == name:
+                return session.session
+        return None
+
+    async def _reconnect_server(self, name: str) -> None:
+        """关闭并重连单个 server；失败记录到 _failures。"""
+
+        for task in self._tasks:
+            if task.get_name() == f"mcp:{name}" and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._sessions = [item for item in self._sessions if item.name != name]
+        self._tools = [
+            item
+            for item in self._tools
+            if not item.full_name.startswith(f"mcp__{name}__")
+        ]
+        server = self._configs.get(name)
+        if server is None:
+            self._failures[name] = "server config not found"
+            return
+        ready: asyncio.Future[Exception | None] = (
+            asyncio.get_running_loop().create_future()
+        )
+        task = asyncio.create_task(
+            _connect_one(self, name, server, self._version, ready),
+            name=f"mcp:{name}",
+        )
+        self._tasks.append(task)
+        try:
+            error = await asyncio.wait_for(
+                asyncio.shield(ready),
+                timeout=connect_timeout,
+            )
+        except TimeoutError:
+            error = RuntimeError("reconnect timeout")
+        if error is not None:
+            self._failures[name] = str(error)
+
+    async def call_server_tool(
+        self,
+        name: str,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+    ) -> Any:
+        """调用远端工具；连接断开时重连一次再重试。"""
+
+        caller = self.get_client(name)
+        if caller is None:
+            await self._reconnect_server(name)
+            caller = self.get_client(name)
+            if caller is None:
+                raise RuntimeError(
+                    self._failures.get(name, f"server {name} unavailable")
+                )
+        try:
+            return await caller.call_tool(tool_name, arguments)
+        except Exception as error:
+            await self._reconnect_server(name)
+            caller = self.get_client(name)
+            if caller is None:
+                raise error
+            return await caller.call_tool(tool_name, arguments)
 
     def tools(self) -> list[McpTool]:
         return list(self._tools)
@@ -68,6 +153,46 @@ class Manager:
             connected_servers=len(self._sessions),
             registered_tools=len(self._tools),
         )
+
+    def server_summary(self) -> list[McpServerStatus]:
+        connected = {session.name for session in self._sessions}
+        counts: dict[str, int] = {}
+        for tool in self._tools:
+            parts = tool.full_name.split("__")
+            if len(parts) >= 3:
+                server = parts[1]
+                counts[server] = counts.get(server, 0) + 1
+        names = sorted(set(connected) | set(self._failures))
+        return [
+            McpServerStatus(
+                name=name,
+                tool_count=counts.get(name, 0),
+                connected=name in connected,
+                error=self._failures.get(name),
+            )
+            for name in names
+        ]
+
+    def instructions_text(self) -> str:
+        """按 server 名生成 MCP 指令段落；无 instructions 时列工具名。"""
+
+        if not self._sessions:
+            return ""
+        parts: list[str] = []
+        for session in sorted(self._sessions, key=lambda item: item.name):
+            section = f"## {session.name}\n"
+            if session.mcp_instructions:
+                section += session.mcp_instructions
+            else:
+                tool_names = [
+                    tool.full_name
+                    for tool in self._tools
+                    if tool.full_name.startswith(f"mcp__{session.name}__")
+                ]
+                if tool_names:
+                    section += "Available tools: " + ", ".join(tool_names)
+            parts.append(section)
+        return "# MCP Server Instructions\n\n" + "\n\n".join(parts)
 
     async def close(self) -> None:
         if self._closed:
@@ -91,6 +216,8 @@ async def new_manager(cfg: Config, version: str) -> Manager:
     """并发连接全部 server；单个失败不会向调用方传播。"""
 
     manager = Manager(configured_servers=len(cfg.servers))
+    manager._configs = dict(cfg.servers)
+    manager._version = version
     ready_items: list[tuple[str, asyncio.Future[Exception | None]]] = []
     for name, server in cfg.servers.items():
         ready: asyncio.Future[Exception | None] = (
@@ -147,6 +274,7 @@ async def _wait_until_ready(
                 task.cancel()
         return
     if error is not None:
+        manager._failures[name] = str(error)
         print(f"[mcp] warn: connect server {name} failed: {error}", file=sys.stderr)
 
 
@@ -188,12 +316,13 @@ async def _do_connect(
                 client_info=mtypes.Implementation(name="Arkcode", version=version),
             )
         )
-        await session.initialize()
+        init_result = await session.initialize()
+        server_instructions = getattr(init_result, "instructions", "") or ""
         listed = await session.list_tools()
         caller = cast(CallerSession, session)
         adapted_by_name: dict[str, McpTool] = {}
         for remote in listed.tools:
-            tool = adapt_tool(name, remote, caller)
+            tool = adapt_tool(name, remote, caller, manager=manager)
             if tool is None:
                 continue
             if tool.full_name in adapted_by_name:
@@ -205,7 +334,12 @@ async def _do_connect(
         adapted = list(adapted_by_name.values())
 
         async with manager._lock:
-            manager._sessions.append(_Session(name=name, session=session))
+            manager._sessions.append(
+                _Session(
+                    name=name, session=session, mcp_instructions=server_instructions
+                )
+            )
             manager._tools.extend(adapted)
+            manager._failures.pop(name, None)
         ready.set_result(None)
         await manager._stop.wait()

@@ -12,6 +12,33 @@ class NoteType(StrEnum):
     REFERENCE_MATERIAL = "reference_material"
 
 
+class MemoryScope(StrEnum):
+    PROJECT = "project"
+    USER = "user"
+
+
+@dataclass(frozen=True)
+class MemoryEntry:
+    scope: MemoryScope
+    type: NoteType
+    filename: str
+    title: str
+    preview: str
+    updated_at: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.scope.value}:{self.filename}"
+
+
+@dataclass(frozen=True)
+class MemoryTurn:
+    session_id: str
+    turn_id: str
+    user_text: str
+    assistant_text: str
+
+
 @dataclass
 class Note:
     type: NoteType

@@ -1,0 +1,1441 @@
+import asyncio
+import json
+import time
+from collections.abc import AsyncIterator
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+import pytest
+from pydantic import BaseModel
+from rich.console import Console
+from textual.widgets import OptionList, RichLog, Static, TextArea
+
+import Arkcode.application.session as session_module
+import Arkcode.tui.app as app_module
+from Arkcode.agents import (
+    NOTICE_CANCELLED,
+    NOTICE_STREAM_ERR,
+    ApprovalRequest,
+    CompactEvent,
+    CompactPhase,
+)
+from Arkcode.commands import Command, CommandKind
+from Arkcode.config import ProviderConfig
+from Arkcode.context import (
+    CompactCircuitBreaker,
+    RecoveryState,
+    new_session_context,
+)
+from Arkcode.llm import (
+    Message,
+    Request,
+    StreamEnd,
+    StreamError,
+    StreamEvent,
+    TextDelta,
+    ThinkingDelta,
+    ToolCall,
+    ToolCallComplete,
+    ToolDefinition,
+)
+from Arkcode.mcp import McpStatus
+from Arkcode.permissions import Mode, Outcome, new_engine
+from Arkcode.prompts import EXECUTE_DIRECTIVE, plan_reminder
+from Arkcode.sessions import (
+    SessionJournal,
+    SessionMeta,
+    SessionMetaStore,
+    list_sessions,
+)
+from Arkcode.tools import Registry, Result, new_default_registry
+from Arkcode.tools.base import Tool
+from Arkcode.tui.app import ArkCodeApp
+from Arkcode.tui.state import SessionState
+from Arkcode.tui.views.status import status_bar
+from Arkcode.tui.widgets.message_input import MessageInput
+
+
+def provider_config(name: str = "Claude", model: str = "claude-test") -> ProviderConfig:
+    return ProviderConfig(
+        name=name,
+        protocol="anthropic",
+        api_key="secret",
+        model=model,
+    )
+
+
+class ControlledProvider:
+    def __init__(
+        self,
+        events: list[StreamEvent],
+        *,
+        release: asyncio.Event | None = None,
+        name: str = "Claude",
+        model: str = "claude-test",
+    ) -> None:
+        self.name = name
+        self.model = model
+        self.events = events
+        self.release = release
+        self.received: list[tuple[list[Message], list[ToolDefinition], str]] = []
+
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        self.received.append((req.messages, req.tools, req.reminder))
+        if self.release is not None:
+            await self.release.wait()
+        for event in self.events:
+            yield event
+
+
+class ScriptedProvider(ControlledProvider):
+    def __init__(self, scripts: list[list[StreamEvent]]) -> None:
+        super().__init__([])
+        self.scripts = scripts
+        self.call_count = 0
+
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        self.received.append((req.messages, req.tools, req.reminder))
+        script = self.scripts[self.call_count]
+        self.call_count += 1
+        for event in script:
+            yield event
+
+
+class SlowReadParams(BaseModel):
+    pass
+
+
+class SlowReadTool(Tool[SlowReadParams]):
+    read_only = True
+    params_model = SlowReadParams
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def name(self) -> str:
+        return "slow_read"
+
+    def description(self) -> str:
+        return "等待测试释放后返回。"
+
+    async def execute(self, params: SlowReadParams) -> Result:
+        self.started.set()
+        await self.release.wait()
+        return Result("slow result")
+
+
+def log_text(log: RichLog) -> str:
+    return "\n".join(line.text for line in log.lines)
+
+
+def static_text(widget: Static) -> str:
+    console = Console(width=100, record=True)
+    console.print(widget.render())
+    return console.export_text()
+
+
+def rich_text(renderable: object) -> str:
+    console = Console(width=100, record=True)
+    console.print(renderable)
+    return console.export_text()
+
+
+def complete(call: ToolCall) -> ToolCallComplete:
+    return ToolCallComplete(call.id, call.name, json.loads(call.input))
+
+
+def end(input_tokens: int = 0, output_tokens: int = 0) -> StreamEnd:
+    return StreamEnd("tool_use", input_tokens, output_tokens)
+
+
+def make_app(providers: list[ProviderConfig]) -> ArkCodeApp:
+    return ArkCodeApp(providers, "0.1.0", new_default_registry())
+
+
+def make_permission_app(providers: list[ProviderConfig], root: Path) -> ArkCodeApp:
+    engine, error = new_engine(str(root))
+    assert error is None
+    return ArkCodeApp(providers, "0.1.0", new_default_registry(), engine)
+
+
+async def wait_until_idle(
+    pilot: Any,
+    app: ArkCodeApp,
+    attempts: int = 100,
+) -> None:
+    for _ in range(attempts):
+        await pilot.pause()
+        if app.state is SessionState.IDLE:
+            return
+    pytest.fail("应用未在预期时间内回到 IDLE")
+
+
+class CompactSpyAgent:
+    def __init__(self) -> None:
+        self.force_calls = 0
+        self.run_calls = 0
+
+    async def run_force_compact(
+        self,
+        conversation: object,
+        definitions: object,
+    ) -> tuple[int, int]:
+        self.force_calls += 1
+        return 120000, 42000
+
+    async def run(self, *args: object) -> AsyncIterator[object]:
+        self.run_calls += 1
+        if False:
+            yield None
+
+
+@pytest.mark.asyncio
+async def test_compact_command_does_not_enter_conversation_or_main_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        spy = CompactSpyAgent()
+        app.agent = spy  # type: ignore[assignment]
+
+        await app.submit("/compact")
+
+        assert spy.force_calls == 1
+        assert spy.run_calls == 0
+        assert app.conv.messages() == []
+        assert "已压缩，token 从 120000 降至 42000" in log_text(
+            app.query_one("#log", RichLog)
+        )
+
+
+@pytest.mark.asyncio
+async def test_unknown_slash_command_is_friendly_and_does_not_run_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        spy = CompactSpyAgent()
+        app.agent = spy  # type: ignore[assignment]
+
+        await app.submit("/unknown")
+
+        assert spy.run_calls == 0
+        assert app.conv.messages() == []
+        assert "未知命令: /unknown" in log_text(app.query_one("#log", RichLog))
+
+
+@pytest.mark.asyncio
+async def test_resume_command_restores_selected_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    target = tmp_path / ".Arkcode" / "sessions" / "20260808-120000-abcd"
+    journal = SessionJournal(target)
+    journal.append_message(Message(role="user", content="恢复这段对话"))
+    journal.append_message(Message(role="assistant", content="旧回复"))
+    journal.close()
+    SessionMetaStore(target).save(
+        replace(
+            SessionMeta.new(target.name),
+            title="恢复这段对话",
+            model="old-model",
+        )
+    )
+    jsonl = target / "conversation.jsonl"
+    lines = [json.loads(line) for line in jsonl.read_text().splitlines()]
+    for line in lines:
+        line["ts"] = 1
+    jsonl.write_text(
+        "\n".join(json.dumps(line, ensure_ascii=False) for line in lines) + "\n",
+        encoding="utf-8",
+    )
+    runtime = app_module.SessionRuntime(
+        recovery=RecoveryState(),
+        auto_tracking=CompactCircuitBreaker(),
+        session=new_session_context(str(tmp_path)),
+    )
+    active_journal = SessionJournal(runtime.session.session_dir)
+    app = ArkCodeApp(
+        [provider_config()],
+        "0.1.0",
+        new_default_registry(),
+        runtime=runtime,
+        journal=active_journal,
+        sessions_dir=str(tmp_path / ".Arkcode" / "sessions"),
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("/resume")
+        assert app.state is SessionState.RESUMING
+        assert app.query_one("#resume-list", OptionList).display is True
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.state is SessionState.IDLE
+        assert app.runtime.session.session_id == target.name
+        assert app.conv.messages()[:2] == [
+            Message(role="user", content="恢复这段对话"),
+            Message(role="assistant", content="旧回复"),
+        ]
+        assert "本会话已暂停" in app.conv.messages()[-1].content
+        assert f"已恢复会话 {target.name}" in log_text(app.query_one("#log", RichLog))
+        before = len(jsonl.read_text(encoding="utf-8").splitlines())
+        app.conv.add_user("继续旧会话")
+        after = len(jsonl.read_text(encoding="utf-8").splitlines())
+        assert after == before + 1
+
+
+@pytest.mark.asyncio
+async def test_resume_list_supports_navigation_search_and_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    sessions = tmp_path / ".Arkcode" / "sessions"
+    for session_id, title in (
+        ("20260807-120000-aaaa", "alpha topic"),
+        ("20260808-120000-bbbb", "beta topic"),
+    ):
+        journal = SessionJournal(sessions / session_id)
+        journal.append_message(Message(role="user", content=title))
+        journal.close()
+        SessionMetaStore(sessions / session_id).save(
+            replace(
+                SessionMeta.new(session_id),
+                title=title,
+                model="old-model",
+            )
+        )
+    runtime = app_module.SessionRuntime(
+        recovery=RecoveryState(),
+        auto_tracking=CompactCircuitBreaker(),
+        session=new_session_context(str(tmp_path)),
+    )
+    app = ArkCodeApp(
+        [provider_config()],
+        "0.1.0",
+        new_default_registry(),
+        runtime=runtime,
+        journal=SessionJournal(runtime.session.session_dir),
+        sessions_dir=str(sessions),
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        original_id = app.runtime.session.session_id
+        await app.submit("/resume")
+        options = app.query_one("#resume-list", OptionList)
+        assert options.option_count == 2
+        assert "old-model" in app.resume_filtered[0].display_text
+
+        await pilot.press("down")
+        assert options.highlighted == 1
+        await pilot.press("b", "e", "t", "a")
+        assert [item.info.title for item in app.resume_filtered] == ["beta topic"]
+
+        await pilot.press("escape")
+        assert app.state is SessionState.IDLE
+        assert app.runtime.session.session_id == original_id
+
+
+@pytest.mark.asyncio
+async def test_resume_command_is_rejected_while_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    provider = ControlledProvider([TextDelta("done"), end()], release=release)
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await app.submit("long task")
+        await pilot.pause()
+        await app.submit("/resume")
+
+        assert app.state is SessionState.STREAMING
+        assert "请等待当前任务完成" in log_text(app.query_one("#log", RichLog))
+        release.set()
+        await wait_until_idle(pilot, app)
+
+
+@pytest.mark.asyncio
+async def test_slash_help_case_insensitive_and_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert await app.dispatch_slash("/Help") is True
+        output = log_text(app.query_one("#log", RichLog))
+
+        assert all(
+            f"/{name}" in output
+            for name in (
+                "clear",
+                "compact",
+                "do",
+                "exit",
+                "help",
+                "memory",
+                "permission",
+                "plan",
+                "resume",
+                "review",
+                "session",
+                "status",
+            )
+        )
+        assert provider.received == []
+        assert app.conv.messages() == []
+
+
+@pytest.mark.asyncio
+async def test_slash_review_is_persisted_as_user_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([TextDelta("reviewed"), end()])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("/review")
+        await wait_until_idle(pilot, app)
+
+        assert "审查" in provider.received[0][0][0].content
+        assert app.conv.messages()[0].role == "user"
+
+
+@pytest.mark.asyncio
+async def test_slash_clear_starts_new_empty_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    runtime = app_module.SessionRuntime(
+        recovery=RecoveryState(),
+        auto_tracking=CompactCircuitBreaker(),
+        session=new_session_context(str(tmp_path)),
+    )
+    old_id = runtime.session.session_id
+    app = ArkCodeApp(
+        [provider_config()],
+        "0.1.0",
+        new_default_registry(),
+        runtime=runtime,
+        journal=SessionJournal(runtime.session.session_dir),
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.conv.add_user("old")
+        app.usage_in = 100
+        app.usage_out = 20
+        await app.submit("/clear")
+
+        assert app.runtime.session.session_id != old_id
+        assert app.conv.messages() == []
+        assert app.usage_in == app.usage_out == 0
+        assert Path(app.journal.path).is_file()
+        sessions = list_sessions(str(Path(app.journal.path).parents[1]))
+        assert old_id in {item.id for item in sessions}
+
+
+@pytest.mark.asyncio
+async def test_completion_filters_and_executes_highlighted_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        input_box = app.query_one("#input", TextArea)
+        input_box.text = "/"
+        await pilot.pause()
+        assert app.completion.active is True
+        assert len(app.completion.items) == 15
+
+        input_box.text = "/s"
+        await pilot.pause()
+        assert [item.name for item in app.completion.items] == [
+            "sandbox",
+            "session",
+            "skill",
+            "status",
+        ]
+
+        await pilot.press("down", "down", "down", "tab")
+        await pilot.pause()
+        output = log_text(app.query_one("#log", RichLog))
+        assert "ArkCode Status" in output
+        assert input_box.text == ""
+        assert app.completion.active is False
+
+
+@pytest.mark.asyncio
+async def test_completion_enter_executes_highlighted_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        input_box = app.query_one("#input", TextArea)
+        input_box.text = "/s"
+        await pilot.pause()
+
+        await pilot.press("down", "down", "down", "enter")
+        await pilot.pause()
+
+        assert "ArkCode Status" in log_text(app.query_one("#log", RichLog))
+        assert input_box.text == ""
+        assert app.completion.active is False
+
+
+@pytest.mark.asyncio
+async def test_local_commands_work_while_busy_and_ui_commands_are_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.state = SessionState.STREAMING
+        await app.submit("/status")
+        await app.submit("/clear")
+        output = log_text(app.query_one("#log", RichLog))
+
+        assert "ArkCode Status" in output
+        assert "请等待当前任务完成" in output
+
+
+@pytest.mark.asyncio
+async def test_command_handler_errors_are_rendered_without_escaping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async def broken(context: object) -> None:
+        raise RuntimeError("command failed")
+
+    app.cmd_registry.register(Command("broken", "break", CommandKind.LOCAL, broken))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert await app.dispatch_slash("/broken") is True
+
+        assert "command failed" in log_text(app.query_one("#log", RichLog))
+
+
+def test_app_construction_fails_on_builtin_command_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import Arkcode.tui.controllers.skills as skills_module
+
+    original = skills_module.register_builtins
+
+    async def duplicate(context: object) -> None:
+        return None
+
+    def conflicting(registry: object) -> None:
+        original(registry)  # type: ignore[arg-type]
+        registry.register(  # type: ignore[attr-defined]
+            Command("help", "duplicate", CommandKind.LOCAL, duplicate)
+        )
+
+    monkeypatch.setattr(skills_module, "register_builtins", conflicting)
+
+    with pytest.raises(RuntimeError, match="help"):
+        make_app([provider_config()])
+
+
+def test_compact_notice_formats_auto_emergency_success_and_failure() -> None:
+    from Arkcode.tui.views.messages import format_compact_notice
+
+    assert (
+        format_compact_notice(CompactEvent(CompactPhase.BEFORE_AUTO))
+        == "正在压缩上下文..."
+    )
+    assert (
+        format_compact_notice(CompactEvent(CompactPhase.BEFORE_EMERGENCY))
+        == "上下文撞墙，自动压缩中..."
+    )
+    assert (
+        format_compact_notice(
+            CompactEvent(CompactPhase.AFTER_AUTO, before=100, after=20)
+        )
+        == "已压缩，token 从 100 降至 20"
+    )
+    assert "压缩失败" in format_compact_notice(
+        CompactEvent(CompactPhase.AFTER_AUTO, err=RuntimeError("boom"))
+    )
+
+
+@pytest.mark.asyncio
+async def test_single_provider_enters_chat_with_complete_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        await pilot.pause()
+
+        assert app.state is SessionState.IDLE
+        assert app.provider is provider
+        assert app.query_one("#log", RichLog).display is True
+        assert "Ark Code v0.1.0" in log_text(app.query_one("#log", RichLog))
+        assert "Ready" in log_text(app.query_one("#log", RichLog))
+        assert static_text(app.query_one("#prompt", Static)).strip() == "❯"
+        assert app.query_one("#input", TextArea).placeholder == "Send a message..."
+        prompt_region = app.query_one("#prompt", Static).region
+        status_region = app.query_one("#statusbar", Static).region
+        assert prompt_region.intersection(status_region).area == 0
+        assert app.query_one("#input-row").region.height == 4
+        assert app.query_one("#statusbar", Static)
+        rendered_status = rich_text(status_bar(provider))
+        assert "DEFAULT" in rendered_status
+        assert "Claude" not in rendered_status
+        assert "claude-test" in rendered_status
+
+
+@pytest.mark.asyncio
+async def test_single_provider_shows_mcp_summary_after_banner_only_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([TextDelta("完成"), end()])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = ArkCodeApp(
+        [provider_config()],
+        "0.1.0",
+        new_default_registry(),
+        mcp_status=McpStatus(2, 1, 3),
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        output = log_text(app.query_one("#log", RichLog))
+        summary = "MCP 1/2 servers connected · 3 tools registered · 1 failed"
+
+        assert output.index("Ark Code v0.1.0") < output.index(summary)
+        assert output.count(summary) == 1
+
+        await pilot.press("shift+tab")
+        await app.submit("继续")
+        await wait_until_idle(pilot, app)
+
+        assert log_text(app.query_one("#log", RichLog)).count(summary) == 1
+
+
+@pytest.mark.asyncio
+async def test_zero_mcp_status_does_not_add_startup_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = ArkCodeApp(
+        [provider_config()],
+        "0.1.0",
+        new_default_registry(),
+        mcp_status=McpStatus(0, 0, 0),
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        assert "MCP " not in log_text(app.query_one("#log", RichLog))
+
+
+@pytest.mark.asyncio
+async def test_80x24_layout_keeps_conversation_visible_and_input_aligned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = ArkCodeApp(
+        [provider_config()],
+        "0.1.0",
+        new_default_registry(),
+        mcp_status=McpStatus(1, 1, 0),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+
+        log = app.query_one("#log", RichLog)
+        prompt = app.query_one("#prompt", Static)
+        input_box = app.query_one("#input", TextArea)
+        input_row = app.query_one("#input-row")
+        status = app.query_one("#statusbar", Static)
+
+        assert len(log.lines) <= log.content_region.height
+        assert "Ark Code v0.1.0" in log_text(log)
+        assert "MCP 1/1 servers connected · 0 tools registered" in log_text(log)
+        assert prompt.content_region.y == input_box.content_region.y
+        assert log.region.intersection(input_row.region).area == 0
+        assert input_row.region.intersection(status.region).area == 0
+
+
+@pytest.mark.asyncio
+async def test_multiple_providers_require_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = ControlledProvider([], name="GPT", model="gpt-test")
+    monkeypatch.setattr(session_module, "new_provider", lambda config: selected)
+    app = make_app(
+        [
+            provider_config(),
+            provider_config(name="GPT", model="gpt-test"),
+        ]
+    )
+
+    async with app.run_test() as pilot:
+        options = app.query_one("#provider-select", OptionList)
+        assert app.state is SessionState.SELECTING
+        assert options.display is True
+        assert app.query_one("#input", TextArea).display is False
+
+        await pilot.press("down", "enter")
+        await pilot.pause()
+
+        assert app.state is SessionState.IDLE
+        assert app.provider is selected
+        assert options.display is False
+        assert app.query_one("#input", TextArea).display is True
+        assert app.query_one("#statusbar", Static)
+        rendered_status = rich_text(status_bar(selected))
+        assert "DEFAULT" in rendered_status
+        assert "GPT" not in rendered_status
+        assert "gpt-test" in rendered_status
+
+
+@pytest.mark.asyncio
+async def test_multiple_provider_selection_reveals_mcp_summary_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = ControlledProvider([], name="GPT", model="gpt-test")
+    monkeypatch.setattr(session_module, "new_provider", lambda config: selected)
+    app = ArkCodeApp(
+        [
+            provider_config(),
+            provider_config(name="GPT", model="gpt-test"),
+        ],
+        "0.1.0",
+        new_default_registry(),
+        mcp_status=McpStatus(2, 0, 0),
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.press("down", "enter")
+        await pilot.pause()
+
+        output = log_text(app.query_one("#log", RichLog))
+        assert (
+            output.count("MCP 0/2 servers connected · 0 tools registered · 2 failed")
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_shift_tab_cycles_permission_modes_and_statusbar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([TextDelta("模式保持"), end()])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        expected = [
+            Mode.ACCEPT_EDITS,
+            Mode.PLAN,
+            Mode.BYPASS,
+            Mode.DEFAULT,
+        ]
+        labels = ["ACCEPT EDITS", "PLAN", "BYPASS", "DEFAULT"]
+        for mode, label in zip(expected, labels, strict=True):
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            assert app.mode is mode
+            assert app.state is SessionState.IDLE
+            status = rich_text(status_bar(provider, app.mode))
+            assert label in status
+            assert "Claude" not in status
+
+        output = log_text(app.query_one("#log", RichLog))
+        assert output.count("已切换到") == 4
+
+        await pilot.press("shift+tab")
+        assert app.mode is Mode.ACCEPT_EDITS
+        await app.submit("开始下一轮")
+        await wait_until_idle(pilot, app)
+        assert app.mode is Mode.ACCEPT_EDITS
+
+
+@pytest.mark.asyncio
+async def test_approval_menu_returns_allow_forever_and_persists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "approved.txt"
+    requested = ToolCall(
+        "write-approval",
+        "write_file",
+        json.dumps({"path": str(target), "content": "approved"}),
+    )
+    provider = ScriptedProvider(
+        [[complete(requested), end()], [TextDelta("写入完成"), end()]]
+    )
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_permission_app([provider_config()], tmp_path)
+
+    async with app.run_test() as pilot:
+        await app.submit("写入文件")
+        for _ in range(30):
+            await pilot.pause()
+            if app.state is SessionState.APPROVING:
+                break
+
+        assert app.state is SessionState.APPROVING
+        assert app.pending is not None
+        assert app.approve_cursor == 0
+        menu = static_text(app.query_one("#streaming", Static))
+        assert "允许本次" in menu
+        assert "永久允许" in menu
+        assert "拒绝本次" in menu
+
+        response = app.pending.respond
+        await pilot.press("down", "enter")
+        await wait_until_idle(pilot, app)
+
+        assert response.result() is Outcome.ALLOW_FOREVER
+        assert target.read_text(encoding="utf-8") == "approved"
+        assert (tmp_path / ".Arkcode/settings.local.yaml").is_file()
+        assert app.mode is Mode.DEFAULT
+
+
+@pytest.mark.asyncio
+async def test_escape_denies_pending_approval_without_exiting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "denied.txt"
+    requested = ToolCall(
+        "write-denied",
+        "write_file",
+        json.dumps({"path": str(target), "content": "no"}),
+    )
+    provider = ScriptedProvider(
+        [[complete(requested), end()], [TextDelta("已处理拒绝"), end()]]
+    )
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_permission_app([provider_config()], tmp_path)
+
+    async with app.run_test() as pilot:
+        await app.submit("不要写")
+        for _ in range(30):
+            await pilot.pause()
+            if app.state is SessionState.APPROVING:
+                break
+        assert app.pending is not None
+        response = app.pending.respond
+
+        await pilot.press("escape")
+        await wait_until_idle(pilot, app)
+
+        assert response.result() is Outcome.DENY_ONCE
+        assert not target.exists()
+        assert app.state is SessionState.IDLE
+        assert app.conv.messages()[-1].content == NOTICE_CANCELLED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "outcome"),
+    [("1", Outcome.ALLOW_ONCE), ("3", Outcome.DENY_ONCE)],
+)
+async def test_approval_numeric_shortcuts(
+    key: str,
+    outcome: Outcome,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        response: asyncio.Future[Outcome] = asyncio.get_running_loop().create_future()
+        app.query_one("#input", TextArea).disabled = True
+        app.pending = ApprovalRequest("bash", "git status", "需要确认", response)
+        app.state = SessionState.APPROVING
+        app.refresh_streaming_view()
+
+        await pilot.press(key)
+        await pilot.pause()
+
+        assert response.result() is outcome
+        assert app.state is SessionState.STREAMING
+        app.state = SessionState.IDLE
+
+
+@pytest.mark.asyncio
+async def test_submit_streams_then_stores_markdown_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    provider = ControlledProvider(
+        [
+            TextDelta("**你好**"),
+            end(),
+        ],
+        release=release,
+    )
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await app.submit("第一轮")
+        await pilot.pause()
+
+        assert app.state is SessionState.STREAMING
+        assert app.query_one("#input", TextArea).disabled is True
+        assert app.query_one("#input", TextArea).text == ""
+        app.turn_start = time.monotonic() - 2.2
+        app._tick()
+        streaming = static_text(app.query_one("#streaming", Static))
+        assert "Imagining… (2s" in streaming
+        assert "第 1 轮" in streaming
+
+        release.set()
+        await pilot.pause()
+
+        assert app.state is SessionState.IDLE
+        assert app.query_one("#input", TextArea).disabled is False
+        assert provider.received[0][0] == [Message(role="user", content="第一轮")]
+        assert len(provider.received[0][1]) == 9
+        assert app.conv.messages() == [
+            Message(role="user", content="第一轮"),
+            Message(role="assistant", content="**你好**"),
+        ]
+        completed = log_text(app.query_one("#log", RichLog))
+        assert "第一轮" in completed
+        assert "你好" in completed
+        assert "2." in completed
+        assert static_text(app.query_one("#streaming", Static)) == "\n"
+
+
+@pytest.mark.asyncio
+async def test_buffered_text_delta_yields_control_for_live_rendering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([TextDelta("实时文本"), end()])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await app.submit("请流式回复")
+        for _ in range(20):
+            await pilot.pause()
+            if app.cur_reply:
+                break
+
+        assert (
+            app.cur_reply == "实时文本" or app.conv.messages()[-1].content == "实时文本"
+        )
+        assert (
+            app.cur_reply == "实时文本" or app.conv.messages()[-1].content == "实时文本"
+        )
+
+
+@pytest.mark.asyncio
+async def test_text_delta_waits_for_a_render_frame_before_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([TextDelta("一帧文本"), end()])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        refresh_started = asyncio.Event()
+        release_refresh = asyncio.Event()
+        streaming_view = app.query_one("#streaming", Static)
+
+        async def wait_for_refresh() -> bool:
+            refresh_started.set()
+            await release_refresh.wait()
+            return True
+
+        monkeypatch.setattr(streaming_view, "wait_for_refresh", wait_for_refresh)
+        await app.submit("请流式回复")
+        await asyncio.wait_for(refresh_started.wait(), timeout=0.2)
+
+        assert app.state is SessionState.STREAMING
+        assert app.cur_reply == "一帧文本"
+
+        release_refresh.set()
+        await pilot.pause()
+        assert app.state is SessionState.IDLE
+
+
+@pytest.mark.asyncio
+async def test_error_returns_to_idle_without_adding_assistant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([StreamError(RuntimeError("bad key"))])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await app.submit("会失败")
+        await pilot.pause()
+
+        assert app.state is SessionState.IDLE
+        assert app.conv.messages() == [
+            Message(role="user", content="会失败"),
+            Message(role="assistant", content=NOTICE_STREAM_ERR),
+        ]
+        assert "bad key" in log_text(app.query_one("#log", RichLog))
+        assert app.query_one("#input", TextArea).disabled is False
+
+
+@pytest.mark.asyncio
+async def test_alt_enter_inserts_newline_and_enter_submits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    provider = ControlledProvider(
+        [TextDelta("ok"), end()],
+        release=release,
+    )
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        input_box = app.query_one("#input", MessageInput)
+        input_box.focus()
+        await pilot.press("h", "i", "alt+enter", "x", "enter")
+        await pilot.pause()
+
+        assert app.state is SessionState.STREAMING
+        assert app.conv.messages()[0] == Message(role="user", content="hi\nx")
+
+        release.set()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_plan_then_do_switches_mode_and_executes_immediately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "planned.txt"
+    provider = ScriptedProvider(
+        [
+            [TextDelta("计划内容"), end()],
+            [
+                complete(
+                    ToolCall(
+                        "planned-write",
+                        "write_file",
+                        json.dumps(
+                            {"path": str(target), "content": "按计划执行"},
+                            ensure_ascii=False,
+                        ),
+                    )
+                ),
+                end(),
+            ],
+            [TextDelta("计划执行完成"), end()],
+        ]
+    )
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await app.submit("/plan")
+        await pilot.pause()
+
+        assert app.mode is Mode.PLAN
+        assert app.state is SessionState.IDLE
+        assert "计划模式" in log_text(app.query_one("#log", RichLog))
+        assert "PLAN" in rich_text(
+            status_bar(provider, app.mode, app.usage_in, app.usage_out)
+        )
+
+        await app.submit("检查后制定方案")
+        await wait_until_idle(pilot, app)
+
+        assert [tool.name for tool in provider.received[0][1]] == [
+            "read_file",
+            "glob",
+            "grep",
+            "LoadSkill",
+            "ToolSearch",
+        ]
+        assert provider.received[0][2] == plan_reminder(full=True)
+
+        await app.submit("/do")
+        await wait_until_idle(pilot, app)
+
+        assert app.mode is Mode.NORMAL
+        assert len(provider.received[1][1]) == 9
+        assert provider.received[1][2] == ""
+        assert provider.received[1][0][-1] == Message(
+            role="user",
+            content=EXECUTE_DIRECTIVE,
+        )
+        assert target.read_text(encoding="utf-8") == "按计划执行"
+        assert app.conv.messages()[-1].content == "计划执行完成"
+
+
+@pytest.mark.asyncio
+async def test_escape_cancels_turn_without_exiting_and_next_turn_works(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    provider = ControlledProvider(
+        [TextDelta("继续成功"), end()],
+        release=release,
+    )
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await app.submit("取消这一轮")
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert app.state is SessionState.IDLE
+        assert app.conv.messages()[-1] == Message(
+            role="assistant",
+            content=NOTICE_CANCELLED,
+        )
+
+        release.set()
+        await app.submit("继续")
+        for _ in range(20):
+            await pilot.pause()
+            if app.state is SessionState.IDLE:
+                break
+
+        assert app.state is SessionState.IDLE
+        assert app.conv.messages()[-1].content == "继续成功"
+
+
+@pytest.mark.asyncio
+async def test_usage_and_iteration_are_rendered_and_accumulated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    provider = ControlledProvider(
+        [
+            TextDelta("完成"),
+            StreamEnd("end_turn", 1200, 34, 800, 120),
+        ],
+        release=release,
+    )
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await app.submit("统计用量")
+        await pilot.pause()
+
+        assert "第 1 轮" in static_text(app.query_one("#streaming", Static))
+
+        release.set()
+        for _ in range(20):
+            await pilot.pause()
+            if app.state is SessionState.IDLE:
+                break
+
+        assert app.usage_in == 1200
+        assert app.usage_out == 34
+        assert app.usage_cache_read == 800
+        assert app.usage_cache_creation == 120
+        status = rich_text(
+            status_bar(
+                provider,
+                app.mode,
+                app.usage_in,
+                app.usage_out,
+                app.usage_cache_read,
+                app.usage_cache_creation,
+            )
+        )
+        assert "↑1.2k" in status
+        assert "↓34" in status
+        assert "cache 读 800 / 写 120" in status
+
+
+@pytest.mark.asyncio
+async def test_full_tui_loop_reads_then_writes_across_iterations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.md"
+    target = tmp_path / "summary.txt"
+    source.write_text("Agent Loop 会持续调用工具。", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            [
+                TextDelta("先读取源文件。"),
+                complete(
+                    ToolCall("read-1", "read_file", json.dumps({"path": str(source)}))
+                ),
+                end(10, 1),
+            ],
+            [
+                TextDelta("根据内容写摘要。"),
+                complete(
+                    ToolCall(
+                        "write-1",
+                        "write_file",
+                        json.dumps(
+                            {
+                                "path": str(target),
+                                "content": "Agent Loop 可自动多轮调用工具。",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                ),
+                end(20, 2),
+            ],
+            [
+                TextDelta("读写任务完成。"),
+                end(30, 3),
+            ],
+        ]
+    )
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await app.submit("读取 source.md 后写入 summary.txt")
+        await wait_until_idle(pilot, app)
+
+        assert provider.call_count == 3
+        assert target.read_text(encoding="utf-8") == "Agent Loop 可自动多轮调用工具。"
+        assert (app.usage_in, app.usage_out) == (60, 6)
+        output = log_text(app.query_one("#log", RichLog))
+        positions = [
+            output.index("先读取源文件"),
+            output.index("read_file"),
+            output.index("根据内容写摘要"),
+            output.index("write_file"),
+            output.index("读写任务完成"),
+        ]
+        assert positions == sorted(positions)
+
+
+@pytest.mark.asyncio
+async def test_tui_remains_responsive_while_slow_tool_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slow_tool = SlowReadTool()
+    registry = Registry()
+    registry.register(slow_tool)
+    provider = ScriptedProvider(
+        [
+            [
+                complete(ToolCall("slow-1", "slow_read", "{}")),
+                end(),
+            ],
+            [TextDelta("慢工具完成。"), end()],
+        ]
+    )
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = ArkCodeApp([provider_config()], "0.1.0", registry)
+
+    async with app.run_test() as pilot:
+        await app.submit("运行慢工具")
+        await asyncio.wait_for(slow_tool.started.wait(), timeout=0.5)
+
+        app.turn_start = time.monotonic() - 2.2
+        app._tick()
+        rendered = static_text(app.query_one("#streaming", Static))
+        assert app.state is SessionState.STREAMING
+        assert "slow_read" in rendered
+        assert "Running" in rendered
+        assert "(2s)" in rendered
+
+        slow_tool.release.set()
+        await wait_until_idle(pilot, app)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tool_batch_scrollback_preserves_model_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    target = tmp_path / "combined.txt"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    calls = [
+        ToolCall(
+            "read-1",
+            "read_file",
+            json.dumps({"path": str(first)}),
+        ),
+        ToolCall(
+            "read-2",
+            "read_file",
+            json.dumps({"path": str(second)}),
+        ),
+        ToolCall(
+            "write-1",
+            "write_file",
+            json.dumps({"path": str(target), "content": "first+second"}),
+        ),
+    ]
+    provider = ScriptedProvider(
+        [
+            [
+                TextDelta("开始并发读取后写入。"),
+                *(complete(call) for call in calls),
+                end(),
+            ],
+            [TextDelta("批处理完成。"), end()],
+        ]
+    )
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await app.submit("并发读取两个文件后写入")
+        await wait_until_idle(pilot, app)
+
+        output = log_text(app.query_one("#log", RichLog))
+        preamble = output.index("开始并发读取后写入")
+        read_one = output.index("read_file", preamble)
+        read_two = output.index("read_file", read_one + 1)
+        write = output.index("write_file", read_two)
+        final = output.index("批处理完成", write)
+        assert preamble < read_one < read_two < write < final
+        assert target.read_text() == "first+second"
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_cancels_streaming_turn_without_exiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    provider = ControlledProvider(
+        [TextDelta("不应到达"), end()],
+        release=release,
+    )
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await app.submit("等待并取消")
+        await pilot.pause()
+        await pilot.press("ctrl+c")
+        await wait_until_idle(pilot, app)
+
+        assert app.is_running
+        assert app.conv.messages()[-1].content == NOTICE_CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_exits_when_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ControlledProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert not app.is_running
+
+
+@pytest.mark.asyncio
+async def test_stream_error_recovers_and_next_turn_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            [StreamError(ConnectionError("temporary outage"))],
+            [TextDelta("恢复成功"), end()],
+        ]
+    )
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await app.submit("触发临时错误")
+        await wait_until_idle(pilot, app)
+        assert "temporary outage" in log_text(app.query_one("#log", RichLog))
+
+        await app.submit("重试")
+        await wait_until_idle(pilot, app)
+
+        assert app.conv.messages()[-1].content == "恢复成功"
+        output = log_text(app.query_one("#log", RichLog))
+        assert output.index("temporary outage") < output.index("恢复成功")
+
+
+@pytest.mark.asyncio
+async def test_thinking_is_transient_and_not_written_as_final_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+
+    class ThinkingProvider(ControlledProvider):
+        async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+            self.received.append((req.messages, req.tools, req.reminder))
+            yield ThinkingDelta("先分析文件")
+            await release.wait()
+            yield TextDelta("最终答复")
+            yield StreamEnd("end_turn")
+
+    provider = ThinkingProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+
+    async with app.run_test() as pilot:
+        await app.submit("请分析")
+        for _ in range(10):
+            await pilot.pause()
+            if app.cur_thinking:
+                break
+
+        assert "先分析文件" in static_text(app.query_one("#streaming", Static))
+        release.set()
+        await wait_until_idle(pilot, app)
+
+        output = log_text(app.query_one("#log", RichLog))
+        assert "最终答复" in output
+        assert "先分析文件" not in output

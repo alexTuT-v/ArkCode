@@ -1,0 +1,66 @@
+"""Slash 命令元数据、执行上下文与命令类型。"""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from enum import Enum
+
+from .ports import (
+    CommandUI,
+    SandboxCommands,
+    SessionCommands,
+    SkillCommands,
+    StatusQueries,
+)
+
+
+class CommandKind(Enum):
+    LOCAL = "local"
+    UI = "ui"
+    PROMPT = "prompt"
+
+
+@dataclass(frozen=True, slots=True)
+class CommandContext:
+    """单个命令执行时可访问的强类型端口集合。"""
+
+    args: str
+    session: SessionCommands
+    skills: SkillCommands
+    status: StatusQueries
+    ui: CommandUI
+    sandbox: SandboxCommands
+
+
+@dataclass(frozen=True, slots=True)
+class McpServerInfo:
+    """命令层可见的单个 MCP server 状态。"""
+
+    name: str
+    tool_count: int
+    connected: bool
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxStatus:
+    enabled: bool
+    auto_allow: bool
+    backend: str
+    available: bool
+
+
+Handler = Callable[[CommandContext], Awaitable[None]]
+
+
+@dataclass(slots=True)
+class Command:
+    name: str
+    description: str
+    kind: CommandKind
+    handler: Handler
+    aliases: list[str] = field(default_factory=list)
+    usage: str = ""
+    arg_prompt: str = ""
+    hidden: bool = False

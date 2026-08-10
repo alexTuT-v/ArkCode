@@ -1,173 +1,53 @@
-"""ArkCode 的 Textual 应用与会话状态机。"""
+"""ArkCode 的 Textual 应用：组合、绑定与生命周期。"""
 
 import asyncio
 import time
-from enum import Enum
 from pathlib import Path
 
+from rich.console import RenderableType
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.events import Key
-from textual.message import Message as TextualMessage
 from textual.timer import Timer
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
-from ..agent import Agent, ApprovalRequest, SessionRuntime
-from ..command import Registry as CommandRegistry
-from ..command import (
-    register_builtins,
-    register_skill_commands,
-    register_skill_management,
-)
-from ..compact import (
-    CompactCircuitBreaker,
-    ContentReplacementState,
-    RecoveryState,
-    new_session_context,
-)
-from ..config import ProviderConfig, effective_context_window
-from ..conversation import Conversation
-from ..llm import Provider, new_provider
+from ..agents import ApprovalRequest, SessionRuntime
+from ..application import ApplicationRuntime, SessionService
+from ..commands import CommandRegistry
+from ..config import ProviderConfig
+from ..mcp import Manager as McpManager
 from ..mcp import McpStatus
 from ..memory import Manager as MemoryManager
-from ..permission import Engine, Mode, Outcome
-from ..prompt import render_banner, render_skill_catalog
-from ..session import Writer
-from ..skills import SkillExecutor, SkillLoader
-from ..tool import InstallSkillTool, LoadSkillTool, Registry
-from .commands import dispatch_slash
-from .complete import CompletionMenu
-from .resume import SessionItem, begin_resume, do_resume_session, handle_resume_key
-from .select import provider_options
-from .stream import StreamControllerMixin, ToolDisplay
-from .view import (
-    approval_block,
-    error_block,
-    mcp_status_line,
-    render_markdown,
-    status_bar,
-    streaming_block,
-    user_block,
-)
+from ..permissions import Engine
+from ..sessions import SessionJournal
+from ..skills import SkillLoader
+from ..tools import Registry, ToolSearchTool
+from ..tools.skill_tools import InstallSkillTool, LoadSkillTool
+from .adapters.command_ui import CommandUIAdapter
+from .controllers.approvals import ApprovalController
+from .controllers.chat import ChatController
+from .controllers.commands import CommandController
+from .controllers.completion import CompletionController
+from .controllers.providers import ProviderController
+from .controllers.sessions import SessionController, SessionItem
+from .controllers.skills import SkillsController
+from .state import AppStateMixin, SessionState, next_mode
+from .streaming import StreamingController
+from .streaming.host import StreamingHostApp
+from .views.banner import render_banner
+from .views.status import mcp_status_line
+from .widgets.completion import CompletionMenu
+from .widgets.message_input import MessageInput
+from .widgets.provider_select import provider_options
+from .widgets.status_bar import StatusBar
 
 
-class SessionState(Enum):
-    """当前会话所处的交互阶段。"""
-
-    SELECTING = "selecting"
-    IDLE = "idle"
-    STREAMING = "streaming"
-    APPROVING = "approving"
-    RESUMING = "resuming"
-
-
-def next_mode(mode: Mode) -> Mode:
-    """按 UI 展示顺序循环到下一档权限模式。"""
-
-    return Mode((int(mode) + 1) % len(Mode))
-
-
-class MessageInput(TextArea):
-    """Enter 提交、Alt+Enter 换行的多行输入框。"""
-
-    BINDINGS = [
-        Binding("enter", "submit_message", "Submit", priority=True),
-        Binding("alt+enter", "insert_newline", "New line", priority=True),
-    ]
-
-    class Submitted(TextualMessage):
-        """输入框提交事件。"""
-
-        def __init__(self, text: str) -> None:
-            super().__init__()
-            self.text = text
-
-    def action_submit_message(self) -> None:
-        self.post_message(self.Submitted(self.text))
-
-    def action_insert_newline(self) -> None:
-        self.insert("\n")
-
-
-class ArkCodeApp(StreamControllerMixin, App[None]):
+class ArkCodeApp(AppStateMixin, App[None]):
     """多协议 LLM 终端对话客户端。"""
 
-    CSS = """
-    Screen {
-        layout: vertical;
-        background: $surface;
-    }
-
-    #provider-select {
-        width: 70%;
-        height: auto;
-        max-height: 70%;
-        margin: 2 4;
-        border: round $accent;
-    }
-
-    #resume-list {
-        width: 90%;
-        height: auto;
-        max-height: 70%;
-        margin: 1 4;
-        border: round $accent;
-    }
-
-    #log {
-        width: 1fr;
-        height: 1fr;
-        min-width: 0;
-        padding: 1 2;
-    }
-
-    #streaming {
-        width: 1fr;
-        height: auto;
-        max-height: 40%;
-        padding: 0 2;
-    }
-
-    #input-row {
-        width: 1fr;
-        height: auto;
-        min-height: 3;
-        max-height: 8;
-        border-top: solid $accent;
-    }
-
-    #prompt {
-        width: 3;
-        height: 3;
-        padding: 0 0 0 1;
-        color: $accent;
-        background: transparent;
-    }
-
-    #input {
-        width: 1fr;
-        height: auto;
-        min-height: 3;
-        max-height: 8;
-        border: none;
-    }
-
-    #statusbar {
-        width: 1fr;
-        height: 1;
-        padding: 0 1;
-        background: $panel;
-    }
-
-    #completion {
-        width: 1fr;
-        height: auto;
-        max-height: 10;
-        padding: 0 4;
-    }
-    """
+    CSS_PATH = "styles.tcss"
 
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit", priority=True),
@@ -183,103 +63,87 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
         engine: Engine | None = None,
         mcp_status: McpStatus | None = None,
         runtime: SessionRuntime | None = None,
-        writer: Writer | None = None,
+        journal: SessionJournal | None = None,
         mem_mgr: MemoryManager | None = None,
         instruction_text: str = "",
         memory_text: str = "",
         sessions_dir: str | None = None,
         workspace: str | Path | None = None,
+        session: SessionService | None = None,
+        mcp_manager: McpManager | None = None,
     ) -> None:
         super().__init__()
         self.providers = providers
         self._version = version
         if workspace is not None:
             self.workspace = Path(workspace).resolve()
+        elif session is not None:
+            self.workspace = session.workspace
         elif runtime is not None:
             self.workspace = Path(runtime.session.session_dir).resolve().parents[2]
         else:
             self.workspace = Path.cwd().resolve()
         # Textual 的 App 已占用 ``_registry`` 管理 DOM 节点。
         self._tool_registry = registry
-        self.skill_loader = SkillLoader(self.workspace)
+        self.skill_loader = (
+            session.skills if session is not None else SkillLoader(self.workspace)
+        )
         self.skill_loader.load_all()
+        self.session = session or SessionService(
+            workspace=self.workspace,
+            version=version,
+            registry=self._tool_registry,
+            permissions=engine,
+            skills=self.skill_loader,
+            memory=mem_mgr,
+            instruction_text=instruction_text,
+            memory_text=memory_text,
+            sessions_dir=sessions_dir,
+            runtime=runtime,
+            journal=journal,
+        )
+        self.skills = SkillsController(self, self.session)
         self.load_skill_tool = LoadSkillTool(self.skill_loader)
         self._tool_registry.register(self.load_skill_tool)
+        self._tool_registry.register(ToolSearchTool(self._tool_registry))
         self.install_skill_tool = InstallSkillTool(
             self.skill_loader,
             Path.home() / ".Arkcode" / "skills",
-            self._refresh_skill_integration,
+            self.skills.reload_skills,
         )
         self._tool_registry.register(self.install_skill_tool)
-        self.skill_executor: SkillExecutor | None = None
         self.cmd_registry = CommandRegistry()
-        self._rebuild_command_registry()
+        self.sessions = SessionController(self, self.session)
+        self.approvals = ApprovalController(self)
+        self.completions = CompletionController(self)
+        self.adapter = CommandUIAdapter(self, self.session)
+        self.commands = CommandController(self, self.adapter)
+        self.chat = ChatController(self, self.session, self.commands)
+        self.provider_controller = ProviderController(self, self.session)
+        self.skills.rebuild()
         self.completion = CompletionMenu()
-        self.engine = engine
-        self.runtime = runtime or SessionRuntime(
-            replacement=ContentReplacementState(),
-            recovery=RecoveryState(),
-            auto_tracking=CompactCircuitBreaker(),
-            session=new_session_context(str(self.workspace)),
-        )
-        self.agent: Agent | None = None
-        self._pending_command = ""
         self.mcp_status = mcp_status
         self.state = (
             SessionState.IDLE if len(providers) == 1 else SessionState.SELECTING
         )
-        self.provider: Provider | None = None
-        self.writer = writer or Writer(self.runtime.session.session_dir)
         self.mem_mgr = mem_mgr
-        self.instruction_text = instruction_text
-        self.memory_text = memory_text
-        self.sessions_dir = sessions_dir or str(
-            Path(self.runtime.session.session_dir).parent
-        )
-        self.conv = Conversation(
-            on_append=self.writer.on_append,
-            on_replace=self.writer.on_replace,
-        )
+        self.mcp_manager = mcp_manager
+        self.sessions_dir = sessions_dir or self.session.sessions_dir
         self.resume_list: OptionList
         self.resume_items: list[SessionItem] = []
         self.resume_filtered: list[SessionItem] = []
         self.resume_query = ""
-        self.cur_reply = ""
+        self._streaming_host = StreamingHostApp(self)
+        self.streaming = StreamingController(self._streaming_host)
         self.turn_start = 0.0
         self._stream_task: asyncio.Task[None] | None = None
         self._timer: Timer | None = None
-        self.mode = engine.start_mode() if engine is not None else Mode.DEFAULT
         self.pending: ApprovalRequest | None = None
         self.approve_cursor = 0
-        self.iter = 0
         self.usage_in = 0
         self.usage_out = 0
         self.usage_cache_read = 0
         self.usage_cache_creation = 0
-        self.cur_thinking = ""
-        self.cur_tools: list[ToolDisplay] = []
-        self.turn_cancel: asyncio.Event | None = None
-        self._fork_tasks: set[asyncio.Task[None]] = set()
-
-    def _rebuild_command_registry(self) -> None:
-        self.cmd_registry.clear()
-        register_builtins(self.cmd_registry)
-        register_skill_management(self.cmd_registry, self.skill_loader)
-        if self.skill_executor is not None:
-            register_skill_commands(
-                self.cmd_registry,
-                self.skill_loader,
-                self.skill_executor,
-            )
-
-    def _refresh_skill_integration(self) -> None:
-        """在 Loader 已刷新后同步命令表与 Agent Catalog。"""
-
-        if self.agent is not None:
-            self.agent.set_skill_catalog(
-                render_skill_catalog(self.skill_loader.get_catalog())
-            )
-        self._rebuild_command_registry()
 
     def compose(self) -> ComposeResult:
         if len(self.providers) > 1:
@@ -298,93 +162,23 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
                 placeholder="Send a message...",
             )
         yield Static("", id="completion")
-        yield Static("", id="statusbar")
+        yield StatusBar(id="statusbar")
 
     def on_mount(self) -> None:
         self.resume_list = self.query_one("#resume-list", OptionList)
         self.resume_list.display = False
-        log = self.query_one("#log", RichLog)
-        log.write(render_banner(self._version, str(self.workspace)))
+        self.write_log(render_banner(self._version, str(self.workspace)))
         if self.mcp_status is not None:
             summary = mcp_status_line(self.mcp_status)
             if summary is not None:
-                log.write(summary)
+                self.write_log(summary)
         if len(self.providers) == 1:
-            self._activate_provider(self.providers[0])
+            self.provider_controller.activate(self.providers[0])
             return
-        self._show_selection()
+        self.provider_controller.show_selection()
 
     async def on_unmount(self) -> None:
-        pending = list(self._fork_tasks)
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        self._fork_tasks.clear()
-        self.writer.close()
-
-    def _show_selection(self) -> None:
-        self.state = SessionState.SELECTING
-        for selector in (
-            "#log",
-            "#streaming",
-            "#input-row",
-            "#input",
-            "#prompt",
-            "#statusbar",
-        ):
-            self.query_one(selector).display = False
-        self.query_one("#provider-select", OptionList).focus()
-
-    def _activate_provider(self, config: ProviderConfig) -> None:
-        self.provider = new_provider(config)
-        self.writer.set_model(self.provider.model)
-        if self.mem_mgr is not None:
-            self.mem_mgr.set_provider(self.provider, self.provider.model)
-        self.runtime.context_window = effective_context_window(config)
-        self.agent = Agent(
-            self.provider,
-            self._tool_registry,
-            self._version,
-            self.engine,
-            runtime=self.runtime,
-            memory_manager=self.mem_mgr,
-            instruction_text=self.instruction_text,
-            memory_text=self.memory_text,
-        )
-        self.load_skill_tool.set_agent(self.agent)
-        self.skill_executor = SkillExecutor(
-            self.agent,
-            self.conv,
-            config,
-            self._tool_registry,
-            self.engine,
-            self._version,
-            self.workspace,
-        )
-        self.agent.set_skill_catalog(
-            render_skill_catalog(self.skill_loader.get_catalog())
-        )
-        register_skill_commands(
-            self.cmd_registry,
-            self.skill_loader,
-            self.skill_executor,
-        )
-        self.state = SessionState.IDLE
-        option_list = self.query("#provider-select")
-        if option_list:
-            option_list.first().display = False
-        for selector in (
-            "#log",
-            "#streaming",
-            "#input-row",
-            "#input",
-            "#prompt",
-            "#statusbar",
-        ):
-            self.query_one(selector).display = True
-        self._update_statusbar()
-        self.query_one("#input", MessageInput).focus()
+        await self.session.shutdown()
 
     async def on_option_list_option_selected(
         self, event: OptionList.OptionSelected
@@ -393,12 +187,11 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
             if self.state is SessionState.RESUMING and event.option_index < len(
                 self.resume_filtered
             ):
-                await do_resume_session(
-                    self,
-                    self.resume_filtered[event.option_index].info,
+                await self.sessions.resume(
+                    self.resume_filtered[event.option_index].info
                 )
             return
-        self._activate_provider(self.providers[event.option_index])
+        self.provider_controller.activate(self.providers[event.option_index])
 
     async def on_message_input_submitted(self, event: MessageInput.Submitted) -> None:
         if self.state is SessionState.IDLE and self.completion.active:
@@ -415,9 +208,9 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
             if event.key in {"escape", "backspace", "enter"} or getattr(
                 event, "character", None
             ):
-                await handle_resume_key(self, event)
+                await self.sessions.handle_key(event)
             return
-        if self.state is SessionState.IDLE and await self._handle_completion_key(event):
+        if self.state is SessionState.IDLE and await self.completions.handle_key(event):
             return
         if self.state is not SessionState.APPROVING:
             return
@@ -425,230 +218,86 @@ class ArkCodeApp(StreamControllerMixin, App[None]):
             return
         event.prevent_default()
         event.stop()
-        self.update_approving(event.key)
+        self.approvals.update(event.key)
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area.id != "input":
             return
-        self.completion.update(event.text_area.text, self.cmd_registry)
-        self._render_completion()
+        self.completions.update_from_input(event.text_area.text)
 
-    def _render_completion(self) -> None:
-        self.query_one("#completion", Static).update(
-            self.completion.render(max(1, self.size.width - 8))
-        )
-
-    async def _handle_completion_key(self, event: Key) -> bool:
-        if not self.completion.active:
-            return False
-        if event.key == "up":
-            self.completion.move_up()
-        elif event.key == "down":
-            self.completion.move_down()
-        elif event.key == "escape":
-            self.completion.hide()
-        elif event.key in {"enter", "tab"}:
-            selected = self.completion.selected()
-            if selected is not None:
-                input_box = self.query_one("#input", MessageInput)
-                input_box.text = "/" + selected.name
-                await self.submit(input_box.text)
-            elif event.key == "enter":
-                input_box = self.query_one("#input", MessageInput)
-                await self.submit(input_box.text)
-            else:
-                self.completion.hide()
-        else:
-            return False
-        event.prevent_default()
-        event.stop()
-        self._render_completion()
-        return True
-
-    async def dispatch_slash(self, text: str) -> bool:
-        return await dispatch_slash(self, text)
-
-    def begin_resume(self) -> None:
-        begin_resume(self)
+    def render_completion(self) -> None:
+        self.completions.render()
 
     async def submit(self, text: str) -> None:
-        """提交一轮用户输入；流式期间忽略新的提交。"""
+        await self.chat.submit(text)
 
-        command = text.strip()
-        if not command:
-            return
+    async def dispatch_slash(self, text: str) -> bool:
+        return await self.commands.dispatch(text)
 
-        if await self.dispatch_slash(command):
-            input_box = self.query_one("#input", MessageInput)
-            input_box.clear()
-            self.completion.hide()
-            self._render_completion()
-            return
-        if self.state is not SessionState.IDLE:
-            return
+    def clear_log(self) -> None:
+        self.query_one("#log", RichLog).clear()
 
-        input_box = self.query_one("#input", MessageInput)
-        input_box.clear()
-        await self._submit_user_text(text)
-
-    async def _submit_user_text(
-        self,
-        user_text: str,
-        *,
-        display_text: str | None = None,
-    ) -> None:
-        """把普通用户文本写入会话并启动 Agent 消费任务。"""
-
-        input_box = self.query_one("#input", MessageInput)
-        self.conv.add_user(user_text)
-        self.query_one("#log", RichLog).write(user_block(display_text or user_text))
-        input_box.disabled = True
-        self.cur_reply = ""
-        self.cur_thinking = ""
-        self.cur_tools = []
-        self.iter = 0
-        self.turn_cancel = asyncio.Event()
-        self.turn_start = time.monotonic()
-        self.state = SessionState.STREAMING
-        self._refresh_streaming_view()
-        self._stream_task = asyncio.create_task(self._consume_agent_events())
-        self._timer = self.set_interval(0.1, self._tick)
+    def write_log(self, renderable: RenderableType) -> None:
+        self.query_one("#log", RichLog).write(renderable)
 
     def _tick(self) -> None:
         if self.state in (SessionState.STREAMING, SessionState.APPROVING):
-            self._refresh_streaming_view()
+            self._streaming_host.refresh_streaming_view()
+
+    def refresh_streaming_view(self) -> None:
+        self._streaming_host.refresh_streaming_view()
 
     def _elapsed(self) -> float:
         return max(0.0, time.monotonic() - self.turn_start)
 
-    def _refresh_streaming_view(self) -> None:
-        if self.state is SessionState.APPROVING and self.pending is not None:
-            self.query_one("#streaming", Static).update(
-                approval_block(self.pending, self.approve_cursor)
-            )
-            return
-        self.query_one("#streaming", Static).update(
-            streaming_block(
-                self.cur_reply,
-                int(self._elapsed()),
-                self.cur_tools,
-                self.iter,
-                self.cur_thinking,
-            )
-        )
-
-    async def _wait_for_streaming_refresh(self) -> None:
-        await self.query_one("#streaming", Static).wait_for_refresh()
-
-    def _finish_with_assistant(self, reply: str) -> None:
-        elapsed = self._elapsed()
-        self.query_one("#log", RichLog).write(render_markdown(reply, elapsed))
-        self._finish_turn()
-
-    def _finish_with_error(self, error: Exception) -> None:
-        message = str(error)
-        for provider in self.providers:
-            message = message.replace(provider.api_key, "[REDACTED]")
-        self.query_one("#log", RichLog).write(error_block(message, self._elapsed()))
-        self._finish_turn()
-
-    def _finish_turn(self) -> None:
-        if self._timer is not None:
-            self._timer.stop()
-        self._timer = None
-        self._stream_task = None
-        self.cur_reply = ""
-        self.cur_thinking = ""
-        self.cur_tools = []
-        self.iter = 0
-        self.turn_cancel = None
-        self.pending = None
-        self.approve_cursor = 0
-        self.state = SessionState.IDLE
-        self.query_one("#streaming", Static).update("")
-        input_box = self.query_one("#input", MessageInput)
-        input_box.disabled = False
-        input_box.focus()
-        self._update_statusbar()
-
-    def _update_statusbar(self) -> None:
-        if self.provider is not None:
-            self.query_one("#statusbar", Static).update(
-                status_bar(
-                    self.provider,
-                    self.mode,
-                    self.usage_in,
-                    self.usage_out,
-                    self.usage_cache_read,
-                    self.usage_cache_creation,
-                )
+    def update_statusbar(self) -> None:
+        provider = self.provider
+        if provider is not None:
+            self.query_one("#statusbar", StatusBar).set_status(
+                provider,
+                self.mode,
+                self.usage_in,
+                self.usage_out,
+                self.usage_cache_read,
+                self.usage_cache_creation,
             )
 
     async def action_quit(self) -> None:
         if self.state in (SessionState.STREAMING, SessionState.APPROVING):
             self._cancel_active_turn()
             return
-        self.writer.close()
-        self.exit()
+        self.adapter.request_exit()
 
     def action_cancel_turn(self) -> None:
         if self.state is SessionState.RESUMING:
-            from .resume import cancel_resume
-
-            cancel_resume(self)
+            self.sessions.cancel_resume()
             return
         if self.state in (SessionState.STREAMING, SessionState.APPROVING):
             self._cancel_active_turn()
 
     def _cancel_active_turn(self) -> None:
-        if self.pending is not None and not self.pending.respond.done():
-            self.pending.respond.set_result(Outcome.DENY_ONCE)
-        if self.turn_cancel is not None:
-            self.turn_cancel.set()
-
-    def track_skill_task(self, task: asyncio.Task[None]) -> None:
-        """持有 fork 任务直到完成，避免悬空并支持退出取消。"""
-
-        self._fork_tasks.add(task)
-        task.add_done_callback(self._fork_tasks.discard)
+        self.approvals.cancel()
+        self.session.cancel_turn()
 
     def action_cycle_mode(self) -> None:
         if self.state is not SessionState.IDLE:
             return
         self.mode = next_mode(self.mode)
-        self.query_one("#log", RichLog).write(
-            Text(f"已切换到 {self.mode} 模式", style="dim")
-        )
-        self._update_statusbar()
+        self.write_log(Text(f"已切换到 {self.mode} 模式", style="dim"))
+        self.update_statusbar()
 
 
-def new_app(
-    providers: list[ProviderConfig],
-    version: str,
-    registry: Registry,
-    engine: Engine,
-    mcp_status: McpStatus | None = None,
-    runtime: SessionRuntime | None = None,
-    writer: Writer | None = None,
-    mem_mgr: MemoryManager | None = None,
-    instruction_text: str = "",
-    memory_text: str = "",
-    sessions_dir: str | None = None,
-    workspace: str | Path | None = None,
-) -> ArkCodeApp:
+def new_app(runtime: ApplicationRuntime) -> ArkCodeApp:
     """构造注入权限引擎的 TUI 应用。"""
 
     return ArkCodeApp(
-        providers,
-        version,
-        registry,
-        engine,
-        mcp_status,
-        runtime,
-        writer,
-        mem_mgr,
-        instruction_text,
-        memory_text,
-        sessions_dir,
-        workspace,
+        runtime.config.providers,
+        runtime.version,
+        runtime.tools,
+        runtime.permissions,
+        mcp_status=runtime.mcp_status,
+        mem_mgr=runtime.memory,
+        session=runtime.session,
+        workspace=runtime.workspace,
+        mcp_manager=runtime.mcp,
     )

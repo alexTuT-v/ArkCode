@@ -5,42 +5,46 @@ from __future__ import annotations
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from dataclasses import field as dfield
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml  # type: ignore[import-untyped]
+from pydantic import BaseModel, ConfigDict, Field
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
-@dataclass(frozen=True)
-class ServerConfig:
+class ServerConfig(BaseModel):
     """一个已经完成变量展开和字段校验的 MCP server。"""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
 
     type: Literal["stdio", "http"]
     command: str = ""
-    args: list[str] = field(default_factory=list)
-    env: dict[str, str] = field(default_factory=dict)
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
     url: str = ""
-    headers: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class Config:
+class Config(BaseModel):
     """归一化后的 MCP 配置。"""
 
-    servers: dict[str, ServerConfig] = field(default_factory=dict)
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    servers: dict[str, ServerConfig] = Field(default_factory=dict)
 
 
 @dataclass
 class _RawServer:
     type: Any = None
     command: Any = ""
-    args: Any = field(default_factory=list)
-    env: Any = field(default_factory=dict)
+    args: Any = dfield(default_factory=list)
+    env: Any = dfield(default_factory=dict)
     url: Any = ""
-    headers: Any = field(default_factory=dict)
+    headers: Any = dfield(default_factory=dict)
 
 
 def _warn(message: str) -> None:

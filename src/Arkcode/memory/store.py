@@ -10,7 +10,7 @@ from typing import Any
 
 import yaml  # type: ignore[import-untyped]
 
-from .types import NoteType, UpdateAction
+from .types import MemoryEntry, MemoryScope, NoteType, UpdateAction
 
 _FILENAME_RE = re.compile(
     rf"^(?:{'|'.join(item.value for item in NoteType)})_"
@@ -36,6 +36,19 @@ class Store:
         except FileNotFoundError:
             return ""
 
+    def clear(self) -> None:
+        """删除目录内全部笔记并重建索引；MEMORY.md 本身保留。"""
+
+        with self._lock:
+            for path in self._dir.glob("*.md"):
+                if path.name == "MEMORY.md":
+                    continue
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            self._rebuild_index()
+
     @staticmethod
     def _parse_note(path: Path) -> tuple[dict[str, Any], str]:
         text = path.read_text(encoding="utf-8")
@@ -57,9 +70,47 @@ class Store:
         return f"---\n{frontmatter}\n---\n{content.strip()}\n"
 
     @staticmethod
-    def _validate_filename(filename: str) -> None:
+    def validate_filename(filename: str) -> None:
         if not _FILENAME_RE.fullmatch(filename):
             raise ValueError(f"非法记忆文件名: {filename}")
+
+    @staticmethod
+    def validate_slug(slug: str) -> None:
+        if not _SLUG_RE.fullmatch(slug):
+            raise ValueError(f"非法记忆 slug: {slug}")
+
+    def read(self, filename: str) -> str:
+        self.validate_filename(filename)
+        return (self._dir / filename).read_text(encoding="utf-8")
+
+    def list_entries(self, scope: MemoryScope) -> list[MemoryEntry]:
+        entries: list[MemoryEntry] = []
+        for path in sorted(self._dir.glob("*.md")):
+            if path.name == "MEMORY.md" or not _FILENAME_RE.fullmatch(path.name):
+                continue
+            try:
+                metadata, content = self._parse_note(path)
+                note_type = NoteType(str(metadata["type"]))
+            except (KeyError, OSError, ValueError, yaml.YAMLError):
+                continue
+            entries.append(
+                MemoryEntry(
+                    scope=scope,
+                    type=note_type,
+                    filename=path.name,
+                    title=str(metadata.get("title", path.stem)),
+                    preview=" ".join(content.split())[:100],
+                    updated_at=str(metadata.get("updated", "")),
+                )
+            )
+            if len(entries) >= 200:
+                break
+        return entries
+
+    def rebuild_index(self) -> None:
+        with self._lock:
+            self.ensure_dir()
+            self._rebuild_index()
 
     def _rebuild_index(self) -> None:
         lines: list[str] = []
@@ -88,21 +139,27 @@ class Store:
                 now = datetime.now().astimezone().isoformat()
                 if action.action == "create":
                     note_type = NoteType(action.type)
-                    if not _SLUG_RE.fullmatch(action.slug):
-                        raise ValueError(f"非法记忆 slug: {action.slug}")
+                    self.validate_slug(action.slug)
                     filename = f"{note_type.value}_{action.slug}.md"
-                    self._validate_filename(filename)
-                    metadata = {
-                        "type": note_type.value,
-                        "title": action.title,
-                        "created": now,
-                        "updated": now,
-                    }
-                    (self._dir / filename).write_text(
+                    self.validate_filename(filename)
+                    path = self._dir / filename
+                    if path.exists():
+                        metadata, _ = self._parse_note(path)
+                        metadata["type"] = note_type.value
+                        metadata["title"] = action.title
+                        metadata["updated"] = now
+                    else:
+                        metadata = {
+                            "type": note_type.value,
+                            "title": action.title,
+                            "created": now,
+                            "updated": now,
+                        }
+                    path.write_text(
                         self._render(metadata, action.content), encoding="utf-8"
                     )
                 elif action.action == "update":
-                    self._validate_filename(action.filename)
+                    self.validate_filename(action.filename)
                     path = self._dir / action.filename
                     metadata, old_content = self._parse_note(path)
                     metadata["title"] = action.title or metadata.get("title", "")
@@ -110,7 +167,7 @@ class Store:
                     content = action.content or old_content
                     path.write_text(self._render(metadata, content), encoding="utf-8")
                 elif action.action == "delete":
-                    self._validate_filename(action.filename)
+                    self.validate_filename(action.filename)
                     (self._dir / action.filename).unlink(missing_ok=True)
                 else:
                     raise ValueError(f"未知记忆操作: {action.action}")

@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
-from ..tool.base import ToolDefinition as ToolDefinition
+from ..tools.base import ToolDefinition as ToolDefinition
 
 ROLE_USER: Literal["user"] = "user"
 ROLE_ASSISTANT: Literal["assistant"] = "assistant"
