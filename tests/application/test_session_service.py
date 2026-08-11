@@ -11,7 +11,7 @@ import pytest
 import Arkcode.application.session as session_module
 from Arkcode.agents import NOTICE_CANCELLED
 from Arkcode.application import SessionService
-from Arkcode.config import ProviderConfig
+from Arkcode.config import Config, Features, ProviderConfig
 from Arkcode.llm import Message, StreamEnd, TextDelta
 from Arkcode.permissions import Mode, new_engine
 from Arkcode.sessions import (
@@ -42,6 +42,70 @@ def config() -> ProviderConfig:
     return ProviderConfig(
         name="fake", protocol="openai", api_key="secret", model="main-model"
     )
+
+
+@pytest.mark.asyncio
+async def test_coordinator_mode_filters_agent_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, error = new_engine(str(tmp_path))
+    assert error is None
+    skills = SkillLoader(tmp_path)
+    skills.load_all()
+    registry = new_default_registry()
+    from Arkcode.subagents.approvals import ApprovalBroker
+    from Arkcode.subagents.catalog import Catalog
+    from Arkcode.subagents.launcher import SubAgentLauncher
+    from Arkcode.subagents.manager import TaskManager
+    from Arkcode.subagents.tools import AgentTool, JobStopTool
+    from Arkcode.teams.manager import TeamManager
+    from Arkcode.teams.tools import (
+        SendMessageTool,
+        TeamDeleteTool,
+        TeamServices,
+    )
+
+    task_manager = TaskManager()
+    launcher = SubAgentLauncher(
+        catalog=Catalog(project_root=tmp_path, user_root=tmp_path),
+        task_manager=task_manager,
+        broker=ApprovalBroker(),
+        engine=engine,
+        version="test",
+        workspace=tmp_path,
+    )
+    team_manager = TeamManager(tmp_path, task_mgr=task_manager)
+    services = TeamServices(
+        team_manager=team_manager,
+        task_manager=task_manager,
+    )
+    registry.register(AgentTool(launcher))
+    registry.register(JobStopTool(task_manager))
+    registry.register(SendMessageTool(services))
+    registry.register(TeamDeleteTool(services))
+    service = SessionService(
+        workspace=tmp_path,
+        version="test",
+        registry=registry,
+        permissions=engine,
+        skills=skills,
+        config=Config(
+            providers=[],
+            features=Features(coordinator_mode=True),
+        ),
+    )
+    monkeypatch.setenv("ArkCODE_COORDINATOR_MODE", "1")
+    from Arkcode.teams.coordinator import COORDINATOR_ALLOWED_TOOLS
+
+    provider = RecordingProvider()
+    monkeypatch.setattr(session_module, "new_provider", lambda _: provider)
+    service.activate_provider(config())
+    assert service.agent is not None
+    names = {
+        definition.name for definition in service.agent._registry.definitions()
+    }
+    assert names == set(COORDINATOR_ALLOWED_TOOLS)
 
 
 class RecordingProvider:
