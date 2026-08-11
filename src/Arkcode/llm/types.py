@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
-from ..tool.base import ToolDefinition as ToolDefinition
+from ..tools.base import ToolDefinition as ToolDefinition
 
 ROLE_USER: Literal["user"] = "user"
 ROLE_ASSISTANT: Literal["assistant"] = "assistant"
@@ -54,7 +54,7 @@ class Request:
     """一次模型请求所需的协议无关输入。"""
 
     messages: list[Message] = field(default_factory=list)
-    tools: list[ToolDefinition] = field(default_factory=list)
+    tools: list[ToolDefinition] | None = field(default_factory=list)
     system: System = field(default_factory=System)
     reminder: str = ""
 

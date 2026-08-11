@@ -4,12 +4,12 @@ import asyncio
 from pathlib import Path
 
 from Arkcode import __version__
-from Arkcode.agent import new_agent
+from Arkcode.agents import new_agent
 from Arkcode.config import load
-from Arkcode.conversation import Conversation
+from Arkcode.conversations import Conversation
 from Arkcode.llm import new_provider
-from Arkcode.permission import Mode, new_engine
-from Arkcode.tool import new_default_registry
+from Arkcode.permissions import Mode, new_engine
+from Arkcode.tools import new_default_registry
 
 
 async def main() -> None:
