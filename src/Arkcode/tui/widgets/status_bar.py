@@ -18,6 +18,7 @@ class StatusBar(Static):
         usage_out: int,
         usage_cache_read: int,
         usage_cache_creation: int,
+        coordinator: bool = False,
     ) -> None:
         self.update(
             status_bar(
@@ -27,5 +28,6 @@ class StatusBar(Static):
                 usage_out,
                 usage_cache_read,
                 usage_cache_creation,
+                coordinator,
             )
         )

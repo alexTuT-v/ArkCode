@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from ..subagents.catalog import Catalog
     from ..subagents.launcher import SubAgentLauncher
     from ..subagents.manager import TaskManager
+    from ..teams import TeamManager as TeamManagerType
     from ..worktrees import WorktreeManager
 
 
@@ -44,6 +45,7 @@ class ApplicationRuntime:
     launcher: SubAgentLauncher | None = None
     worktree_manager: WorktreeManager | None = None
     sweep_task: asyncio.Task[None] | None = None
+    team_manager: TeamManagerType | None = None
 
     async def shutdown(self) -> None:
         """按 Session → Memory → SubAgent 任务 → 后台任务 → MCP 的顺序关闭。"""
@@ -56,4 +58,14 @@ class ApplicationRuntime:
             self.approval_broker.cancel_all()
         await close_background(self.cleanup_task)
         await close_background(self.sweep_task)
+        if self.team_manager is not None:
+            for team in self.team_manager.list():
+                for member in team.members:
+                    try:
+                        from ..teams.backends.inprocess import InProcessBackend
+
+                        backend = InProcessBackend(self.task_manager)
+                        await backend.kill(member.pane_id, member.agent_id)
+                    except Exception:
+                        pass
         await close_mcp(self.mcp)

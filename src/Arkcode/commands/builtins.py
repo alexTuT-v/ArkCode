@@ -16,6 +16,7 @@ from .handlers.review import REVIEW_COMMAND
 from .handlers.sandbox import SANDBOX_COMMAND
 from .handlers.session import SESSION_COMMAND
 from .handlers.status import STATUS_COMMAND
+from .handlers.team import TEAM_COMMAND
 from .handlers.worktree import WORKTREE_COMMAND
 from .registry import CommandRegistry
 
@@ -35,6 +36,7 @@ def register_builtins(registry: CommandRegistry) -> None:
         SANDBOX_COMMAND,
         SESSION_COMMAND,
         STATUS_COMMAND,
+        TEAM_COMMAND,
         WORKTREE_COMMAND,
     )
     for command in definitions:

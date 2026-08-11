@@ -53,6 +53,9 @@ class AgentTool(Tool[AgentParams]):
         self._launcher = launcher
         self._team_spawner = team_spawner
 
+    def set_team_spawner(self, spawner: Any | None) -> None:
+        self._team_spawner = spawner
+
     def name(self) -> str:
         return "Agent"
 

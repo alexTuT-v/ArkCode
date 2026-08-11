@@ -37,6 +37,7 @@ def status_bar(
     usage_out: int = 0,
     usage_cache_read: int = 0,
     usage_cache_creation: int = 0,
+    coordinator: bool = False,
 ) -> Table:
     """渲染当前权限模式、模型与累计 token 用量。"""
 
@@ -51,6 +52,8 @@ def status_bar(
         Mode.DONT_ASK: ("DONT ASK", "magenta"),
     }
     label, style = labels[mode]
+    if coordinator:
+        label = f"{label} [COORDINATOR]"
     usage = (
         f"↑{_compact_tokens(usage_in)} ↓{_compact_tokens(usage_out)} tok"
         f" · cache 读 {_compact_tokens(usage_cache_read)}"

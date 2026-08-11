@@ -26,13 +26,27 @@ class FakeWorktree:
         return f"已删除 {slug} discard={discard}"
 
 
+class FakeTeam:
+    def list_teams(self) -> list[tuple[str, str, int, int]]:
+        return [("demo", "in-process", 1, 1)]
+
+    async def team_info(self, name: str) -> str:
+        return f"Team {name} 详情"
+
+    async def delete_team(self, name: str, force: bool) -> str:
+        return f"已删除 {name} force={force}"
+
+    async def kill_member(self, member: str) -> str:
+        return f"已停止 {member}"
+
+
 def builtins() -> CommandRegistry:
     registry = CommandRegistry()
     register_builtins(registry)
     return registry
 
 
-def test_registers_exactly_fifteen_visible_commands() -> None:
+def test_registers_exactly_sixteen_visible_commands() -> None:
     registry = builtins()
     assert [item.name for item in registry.visible()] == [
         "clear",
@@ -49,6 +63,7 @@ def test_registers_exactly_fifteen_visible_commands() -> None:
         "sandbox",
         "session",
         "status",
+        "team",
         "worktree",
     ]
     assert {item.kind for item in registry.visible()} == {
@@ -90,6 +105,40 @@ async def test_worktree_commands_route_to_port() -> None:
     )
     assert await dispatch(registry, "worktree", listed)
     assert "alice" in ui.lines[-1]
+
+
+@pytest.mark.asyncio
+async def test_team_commands_route_to_port() -> None:
+    from Arkcode.commands import CommandContext
+
+    registry = builtins()
+    ui = FakeUI()
+    session = FakeSession()
+    team = FakeTeam()
+
+    listed = CommandContext(
+        args="list",
+        session=session,
+        skills=FakeSkills(),
+        status=FakeStatus(),
+        ui=ui,
+        sandbox=session,
+        team=team,  # type: ignore[arg-type]
+    )
+    assert await dispatch(registry, "team", listed)
+    assert "demo" in ui.lines[-1]
+
+    deleted = CommandContext(
+        args="delete demo --force",
+        session=session,
+        skills=FakeSkills(),
+        status=FakeStatus(),
+        ui=ui,
+        sandbox=session,
+        team=team,  # type: ignore[arg-type]
+    )
+    assert await dispatch(registry, "team", deleted)
+    assert "force=True" in ui.lines[-1]
 
 
 @pytest.mark.asyncio

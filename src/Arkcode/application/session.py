@@ -15,8 +15,6 @@ if TYPE_CHECKING:
     from ..subagents.approvals import ApprovalBroker
     from ..subagents.catalog import Catalog
     from ..subagents.launcher import SubAgentLauncher
-    from ..subagents.manager import TaskManager
-
 from ..agents import Agent, AgentEvent, SessionRuntime
 from ..agents.identity import AgentIdentity, current_identity
 from ..agents.parent import ParentContext, parent_scope
@@ -41,6 +39,13 @@ from ..sessions import (
 )
 from ..sessions.record import CompactBoundary
 from ..skills import SkillExecutor, SkillLoader
+from ..subagents.filter import RegistryPolicy, RegistryView
+from ..subagents.manager import TaskManager
+from ..teams.coordinator import (
+    COORDINATOR_ALLOWED_TOOLS,
+    COORDINATOR_SYSTEM_PROMPT_SUFFIX,
+    is_enabled,
+)
 from ..tools import Registry
 from ..tools.workspace import ExecutionPathContext, workspace_scope
 
@@ -150,6 +155,7 @@ class SessionService:
         approval_broker: ApprovalBroker | None = None,
         launcher: SubAgentLauncher | None = None,
         worktree_manager: object | None = None,
+        team_manager: object | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self._version = version
@@ -168,6 +174,7 @@ class SessionService:
         self.approval_broker: ApprovalBroker | None = approval_broker
         self.launcher: SubAgentLauncher | None = launcher
         self.worktree_manager = worktree_manager
+        self.team_manager = team_manager
         self.active_workspace: ExecutionPathContext | None = None
         self.runtime = runtime or SessionRuntime(
             recovery=RecoveryState(),
@@ -206,17 +213,34 @@ class SessionService:
             self._memory.set_provider(provider, provider.model)
         self.runtime.context_window = effective_context_window(config)
         self.provider = provider
+        agent_registry: Registry = self._registry
+        instruction_text = (
+            self._instruction_text
+            + ("\n\n" + self._mcp_instructions if self._mcp_instructions else "")
+        )
+        if self._config is not None and is_enabled(self._config):
+            policy = RegistryPolicy(
+                globally_denied=frozenset(),
+                allowed=COORDINATOR_ALLOWED_TOOLS,
+                denied=frozenset(),
+                background_allowed=None,
+            )
+            agent_registry = RegistryView.from_parent(
+                self._registry,
+                policy,
+                copy_discovery=False,
+            )
+            instruction_text = (
+                instruction_text + COORDINATOR_SYSTEM_PROMPT_SUFFIX
+            )
         self.agent = Agent(
             provider,
-            self._registry,
+            agent_registry,
             self._version,
             self._permissions,
             runtime=self.runtime,
             memory_manager=self._memory,
-            instruction_text=(
-                self._instruction_text
-                + ("\n\n" + self._mcp_instructions if self._mcp_instructions else "")
-            ),
+            instruction_text=instruction_text,
             memory_text=self._memory_text,
         )
         self.skill_executor = SkillExecutor(

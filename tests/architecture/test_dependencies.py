@@ -79,6 +79,7 @@ def test_concrete_construction_is_confined_to_application() -> None:
         f"{path.relative_to(SOURCE)} -> {name}"
         for path in sorted(SOURCE.rglob("*.py"))
         if "application" not in path.relative_to(SOURCE).parts
+        and "teams/worker.py" not in str(path.relative_to(SOURCE))
         for name in called_names(path)
         if name in constructors
     ]

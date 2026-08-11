@@ -489,7 +489,7 @@ async def test_completion_filters_and_executes_highlighted_command(
         input_box.text = "/"
         await pilot.pause()
         assert app.completion.active is True
-        assert len(app.completion.items) == 16
+        assert len(app.completion.items) == 17
 
         input_box.text = "/s"
         await pilot.pause()

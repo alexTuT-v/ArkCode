@@ -1,5 +1,6 @@
 """ArkCode 命令行入口。"""
 
+import argparse
 import asyncio
 import sys
 from pathlib import Path
@@ -22,8 +23,34 @@ async def _amain() -> int:
     return 0
 
 
+def _parse_team_member_args() -> argparse.Namespace | None:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--team-member", action="store_true")
+    parser.add_argument("--team")
+    parser.add_argument("--member")
+    parser.add_argument("--agent-id")
+    parser.add_argument("--session-dir")
+    parser.add_argument("--worktree")
+    parser.add_argument("--agent-type")
+    parser.add_argument("--model")
+    parser.add_argument("--plan-mode", action="store_true")
+    try:
+        args, _ = parser.parse_known_args(sys.argv[1:])
+    except SystemExit:
+        return None
+    return args
+
+
 def main() -> None:
     """加载配置并启动终端界面。"""
+
+    if "--team-member" in sys.argv[1:]:
+        args = _parse_team_member_args()
+        if args is None:
+            raise SystemExit(2)
+        from ..teams.worker import run_team_member
+
+        raise SystemExit(asyncio.run(run_team_member(args)))
 
     if "--version" in sys.argv[1:]:
         print(__version__)

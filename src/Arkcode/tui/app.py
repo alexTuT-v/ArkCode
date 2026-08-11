@@ -37,7 +37,11 @@ from .controllers.skills import SkillsController
 from .state import AppStateMixin, SessionState, next_mode
 from .streaming import StreamingController
 from .streaming.host import StreamingHostApp
-from .tasks import consume_job_notifications, consume_subagent_approvals
+from .tasks import (
+    consume_job_notifications,
+    consume_lead_mail,
+    consume_subagent_approvals,
+)
 from .views.banner import render_banner
 from .views.status import mcp_status_line
 from .widgets.completion import CompletionMenu
@@ -74,6 +78,7 @@ class ArkCodeApp(AppStateMixin, App[None]):
         session: SessionService | None = None,
         mcp_manager: McpManager | None = None,
         worktree_manager: WorktreeManager | None = None,
+        team_manager: object | None = None,
     ) -> None:
         super().__init__()
         self.providers = providers
@@ -132,6 +137,7 @@ class ArkCodeApp(AppStateMixin, App[None]):
         self.mem_mgr = mem_mgr
         self.mcp_manager = mcp_manager
         self.worktree_manager = worktree_manager
+        self.team_manager = team_manager
         self.sessions_dir = sessions_dir or self.session.sessions_dir
         self.resume_list: OptionList
         self.resume_items: list[SessionItem] = []
@@ -149,6 +155,10 @@ class ArkCodeApp(AppStateMixin, App[None]):
         self.usage_cache_read = 0
         self.usage_cache_creation = 0
         self._consumer_tasks: list[asyncio.Task[None]] = []
+        self.lead_mail_event = asyncio.Event()
+        if team_manager is None:
+            team_manager = getattr(self.session, "team_manager", None)
+        self.team_manager = team_manager
 
     def compose(self) -> ComposeResult:
         if len(self.providers) > 1:
@@ -196,6 +206,33 @@ class ArkCodeApp(AppStateMixin, App[None]):
             self._consumer_tasks.append(
                 asyncio.create_task(consume_subagent_approvals(broker, self))
             )
+        team_manager = getattr(self.session, "team_manager", None)
+        if team_manager is not None:
+            self._consumer_tasks.append(
+                asyncio.create_task(
+                    consume_lead_mail(
+                        team_manager,
+                        self.session,
+                        self.lead_mail_event,
+                    )
+                )
+            )
+            self._consumer_tasks.append(
+                asyncio.create_task(self._lead_mail_watcher())
+            )
+
+    async def _lead_mail_watcher(self) -> None:
+        """Lead idle 时收到邮件自动发起一轮 autonomous turn。"""
+
+        while True:
+            await self.lead_mail_event.wait()
+            self.lead_mail_event.clear()
+            if self.state is SessionState.IDLE and self.provider is not None:
+                await self.chat.submit_user_text(
+                    "[team-update] 队员发来新消息，请按 Coordinator 流程处理，"
+                    "汇总进展并决定下一步。",
+                    display_text="[team-update]",
+                )
 
     async def on_unmount(self) -> None:
         for task in self._consumer_tasks:
@@ -278,6 +315,12 @@ class ArkCodeApp(AppStateMixin, App[None]):
     def update_statusbar(self) -> None:
         provider = self.provider
         if provider is not None:
+            config = getattr(self.session, "_config", None)
+            coordinator = False
+            if config is not None:
+                from ..teams.coordinator import is_enabled
+
+                coordinator = is_enabled(config)
             self.query_one("#statusbar", StatusBar).set_status(
                 provider,
                 self.mode,
@@ -285,6 +328,7 @@ class ArkCodeApp(AppStateMixin, App[None]):
                 self.usage_out,
                 self.usage_cache_read,
                 self.usage_cache_creation,
+                coordinator=coordinator,
             )
 
     async def action_quit(self) -> None:
@@ -340,4 +384,5 @@ def new_app(runtime: ApplicationRuntime) -> ArkCodeApp:
         workspace=runtime.workspace,
         mcp_manager=runtime.mcp,
         worktree_manager=runtime.worktree_manager,
+        team_manager=runtime.team_manager,
     )

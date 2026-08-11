@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from rich.text import Text
 
@@ -11,6 +11,8 @@ from ..agents import ApprovalRequest
 from ..subagents.approvals import ApprovalBroker
 from ..subagents.manager import TaskManager
 from ..subagents.notification import format_task_notification
+from ..teams.mailbox import Box
+from ..teams.models import Message
 from .state import SessionState
 
 if TYPE_CHECKING:
@@ -75,3 +77,40 @@ async def consume_subagent_approvals(
             if app.state is SessionState.APPROVING:
                 app.state = previous_state
             app.refresh_streaming_view()
+
+
+def render_team_update(messages: list[Message]) -> str:
+    """把 Lead 未读邮件渲染为 `<team-update>` reminder。"""
+
+    lines: list[str] = []
+    for index, message in enumerate(messages, 1):
+        lines.append(
+            f"[{index}] 来自 {message.from_agent}"
+            f"(type={message.type.value},ts={message.timestamp}):"
+        )
+        lines.append("    " + message.text)
+    body = "\n".join(lines)[:8000]
+    return f"<team-update>\n{body}\n</team-update>"
+
+
+async def consume_lead_mail(
+    team_manager: Any,
+    session: Any,
+    event: asyncio.Event,
+) -> None:
+    """每秒轮询所有 Team 的 Lead mailbox，注入 reminder 并置位唤醒事件。"""
+
+    while True:
+        await asyncio.sleep(1.0)
+        for team in team_manager.list():
+            box = Box(team.config_dir)
+            messages = await box.read("lead")
+            unread_indexes = [
+                index for index, message in enumerate(messages) if not message.read
+            ]
+            if not unread_indexes:
+                continue
+            unread = [messages[index] for index in unread_indexes]
+            await box.mark_read("lead", unread_indexes)
+            session.append_reminder(render_team_update(unread))
+            event.set()

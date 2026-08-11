@@ -83,10 +83,43 @@ async def build_runtime(workspace: Path, version: str) -> ApplicationRuntime:
         registry.register(JobStopTool(task_manager))
         registry.register(JobSendTool(task_manager))
         registry.disable_timeout("Agent")
+        team_manager = None
         worktree_manager: WorktreeManager | None = None
         sweep_task: asyncio.Task[None] | None = None
         try:
             worktree_manager = await WorktreeManager.open(root)
+            from ..teams.manager import TeamManager
+            from ..teams.registry import AgentNameRegistry
+            from ..teams.spawner import TeamSpawner
+            from ..teams.tools import (
+                SendMessageTool,
+                TeamCreateTool,
+                TeamDeleteTool,
+                TeamServices,
+            )
+
+            team_manager = TeamManager(
+                Path.home(),
+                wt_mgr=worktree_manager,
+                task_mgr=task_manager,
+                name_registry=AgentNameRegistry(),
+            )
+            services = TeamServices(
+                team_manager=team_manager,
+                task_manager=task_manager,
+            )
+            registry.register(TeamCreateTool(services))
+            registry.register(TeamDeleteTool(services))
+            registry.register(SendMessageTool(services))
+            spawner = TeamSpawner(
+                team_manager=team_manager,
+                worktree_manager=worktree_manager,
+                launcher=launcher,
+                session_root=root / ".Arkcode" / "sessions",
+            )
+            agent_tool = registry.get("Agent")
+            if agent_tool is not None:
+                agent_tool.set_team_spawner(spawner)  # type: ignore[attr-defined]
             async def _sweep_background() -> None:
                 await worktree_manager.sweep_stale(
                     datetime.now().astimezone() - timedelta(hours=24)
@@ -115,6 +148,7 @@ async def build_runtime(workspace: Path, version: str) -> ApplicationRuntime:
             approval_broker=approval_broker,
             launcher=launcher,
             worktree_manager=worktree_manager,
+            team_manager=team_manager,
         )
         if (
             worktree_manager is not None
@@ -146,6 +180,7 @@ async def build_runtime(workspace: Path, version: str) -> ApplicationRuntime:
             launcher=launcher,
             worktree_manager=worktree_manager,
             sweep_task=sweep_task,
+            team_manager=team_manager,
         )
     except Exception:
         await mcp_manager.close()

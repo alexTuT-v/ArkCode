@@ -12,6 +12,7 @@ from .ports import (
     SessionCommands,
     SkillCommands,
     StatusQueries,
+    TeamCommands,
     WorktreeCommands,
 )
 
@@ -33,6 +34,7 @@ class CommandContext:
     ui: CommandUI
     sandbox: SandboxCommands
     worktree: WorktreeCommands = field(default_factory=lambda: _NullWorktreeCommands())
+    team: TeamCommands = field(default_factory=lambda: _NullTeamCommands())
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +75,20 @@ class _NullWorktreeCommands:
 
     async def remove_worktree(self, slug: str, *, discard: bool) -> str:
         return "错误: Worktree 功能未启用"
+
+
+class _NullTeamCommands:
+    def list_teams(self) -> list[tuple[str, str, int, int]]:
+        return []
+
+    async def team_info(self, name: str) -> str:
+        return "错误: Team 功能未启用"
+
+    async def delete_team(self, name: str, force: bool) -> str:
+        return "错误: Team 功能未启用"
+
+    async def kill_member(self, member: str) -> str:
+        return "错误: Team 功能未启用"
 
 
 @dataclass(slots=True)

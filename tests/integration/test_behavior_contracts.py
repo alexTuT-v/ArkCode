@@ -42,6 +42,7 @@ def test_builtin_slash_command_contract_is_stable() -> None:
         "sandbox",
             "session",
             "status",
+            "team",
             "worktree",
         ]
 

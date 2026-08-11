@@ -17,6 +17,7 @@ from ...commands import (
     SessionCommands,
     SkillCommands,
     StatusQueries,
+    TeamCommands,
     WorktreeCommands,
 )
 from ...commands.models import SandboxStatus
@@ -45,6 +46,7 @@ class CommandUIAdapter(
     SkillCommands,
     StatusQueries,
     SandboxCommands,
+    TeamCommands,
     WorktreeCommands,
 ):
     """把命令所需的四类能力映射到 ArkCodeApp 与会话服务。"""
@@ -308,3 +310,59 @@ class CommandUIAdapter(
         if report.removed:
             return f"已删除 Worktree {slug}"
         return f"Worktree {slug} 未删除"
+
+    # ---- TeamCommands ----
+
+    def list_teams(self) -> list[tuple[str, str, int, int]]:
+        manager = getattr(self._app, "team_manager", None)
+        if manager is None:
+            return []
+        return [
+            (
+                team.sanitized_name,
+                team.backend.value,
+                len(team.members),
+                sum(
+                    1
+                    for member in team.members
+                    if member.is_active is not False
+                ),
+            )
+            for team in manager.list()
+        ]
+
+    async def team_info(self, name: str) -> str:
+        manager = getattr(self._app, "team_manager", None)
+        if manager is None:
+            return "错误: Team 功能未启用"
+        team = manager.get(name)
+        if team is None:
+            return f"未知 Team: {name}"
+        lines = [
+            f"Team: {team.name} ({team.sanitized_name})",
+            f"backend: {team.backend.value}",
+            f"config: {team.config_path}",
+        ]
+        for member in team.members:
+            lines.append(
+                f"  {member.name}  {member.agent_id}  {member.backend_type.value}  "
+                f"active={member.is_active}  {member.worktree_path}"
+            )
+        return "\n".join(lines)
+
+    async def delete_team(self, name: str, force: bool) -> str:
+        manager = getattr(self._app, "team_manager", None)
+        if manager is None:
+            return "错误: Team 功能未启用"
+        try:
+            await manager.delete(name, force)
+        except Exception as exc:
+            return str(exc)
+        return f"已删除 Team {name}"
+
+    async def kill_member(self, member: str) -> str:
+        manager = getattr(self._app, "team_manager", None)
+        if manager is None:
+            return "错误: Team 功能未启用"
+        stopped = await manager.stop_member(member)
+        return f"已停止队员 {member}" if stopped else f"未知队员: {member}"
