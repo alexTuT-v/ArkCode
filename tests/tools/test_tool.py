@@ -19,6 +19,15 @@ from Arkcode.tools.builtins.grep import GrepTool, _search_in_subprocess
 from Arkcode.tools.builtins.grep import Params as GrepParams
 from Arkcode.tools.builtins.read_file import Params as ReadParams
 from Arkcode.tools.builtins.read_file import ReadFileTool
+from Arkcode.tools.workspace import ExecutionPathContext, workspace_scope
+
+
+@pytest.fixture(autouse=True)
+def _workspace_boundary(tmp_path: Path):
+    """工具按新语义需要在显式 workspace 边界内执行。"""
+
+    with workspace_scope(ExecutionPathContext.at(tmp_path)):
+        yield
 
 
 def test_tool_message_defaults_to_empty_results() -> None:

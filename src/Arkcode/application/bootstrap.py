@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from .. import mcp as mcp_client
@@ -26,6 +26,9 @@ from ..subagents.tools import (
     JobStopTool,
 )
 from ..tools import new_default_registry
+from ..tools.workspace import ExecutionPathContext
+from ..worktrees import WorktreeManager
+from ..worktrees.integration import WorktreeEnvironmentPreparer
 from .runtime import ApplicationRuntime
 from .session import SessionService
 
@@ -68,6 +71,11 @@ async def build_runtime(workspace: Path, version: str) -> ApplicationRuntime:
             providers=list(config.providers),
             parent_config=config.providers[0] if config.providers else None,
             enable_background=config.enable_subagent_background,
+            worktree_preparer_factory=(
+                lambda: WorktreeEnvironmentPreparer(worktree_manager)
+                if worktree_manager is not None
+                else None
+            ),
         )
         registry.register(AgentTool(launcher))
         registry.register(JobListTool(task_manager))
@@ -75,6 +83,18 @@ async def build_runtime(workspace: Path, version: str) -> ApplicationRuntime:
         registry.register(JobStopTool(task_manager))
         registry.register(JobSendTool(task_manager))
         registry.disable_timeout("Agent")
+        worktree_manager: WorktreeManager | None = None
+        sweep_task: asyncio.Task[None] | None = None
+        try:
+            worktree_manager = await WorktreeManager.open(root)
+            async def _sweep_background() -> None:
+                await worktree_manager.sweep_stale(
+                    datetime.now().astimezone() - timedelta(hours=24)
+                )
+
+            sweep_task = asyncio.create_task(_sweep_background())
+        except Exception as exc:
+            print(f"警告: Worktree 功能未启用: {exc}", file=sys.stderr)
         skills = SkillLoader(root)
         skills.load_all()
         session = SessionService(
@@ -94,7 +114,17 @@ async def build_runtime(workspace: Path, version: str) -> ApplicationRuntime:
             catalog=catalog,
             approval_broker=approval_broker,
             launcher=launcher,
+            worktree_manager=worktree_manager,
         )
+        if (
+            worktree_manager is not None
+            and worktree_manager.current_session is not None
+        ):
+            session.set_active_workspace(
+                ExecutionPathContext.at(
+                    worktree_manager.current_session.worktree_path
+                )
+            )
         cleanup_task = asyncio.create_task(
             asyncio.to_thread(clean_expired, sessions_dir, timedelta(days=30))
         )
@@ -114,6 +144,8 @@ async def build_runtime(workspace: Path, version: str) -> ApplicationRuntime:
             task_manager=task_manager,
             approval_broker=approval_broker,
             launcher=launcher,
+            worktree_manager=worktree_manager,
+            sweep_task=sweep_task,
         )
     except Exception:
         await mcp_manager.close()

@@ -25,6 +25,7 @@ from ..sessions import SessionJournal
 from ..skills import SkillLoader
 from ..tools import Registry, ToolSearchTool
 from ..tools.skill_tools import InstallSkillTool, LoadSkillTool
+from ..worktrees import WorktreeManager
 from .adapters.command_ui import CommandUIAdapter
 from .controllers.approvals import ApprovalController
 from .controllers.chat import ChatController
@@ -72,6 +73,7 @@ class ArkCodeApp(AppStateMixin, App[None]):
         workspace: str | Path | None = None,
         session: SessionService | None = None,
         mcp_manager: McpManager | None = None,
+        worktree_manager: WorktreeManager | None = None,
     ) -> None:
         super().__init__()
         self.providers = providers
@@ -129,6 +131,7 @@ class ArkCodeApp(AppStateMixin, App[None]):
         )
         self.mem_mgr = mem_mgr
         self.mcp_manager = mcp_manager
+        self.worktree_manager = worktree_manager
         self.sessions_dir = sessions_dir or self.session.sessions_dir
         self.resume_list: OptionList
         self.resume_items: list[SessionItem] = []
@@ -336,4 +339,5 @@ def new_app(runtime: ApplicationRuntime) -> ArkCodeApp:
         session=runtime.session,
         workspace=runtime.workspace,
         mcp_manager=runtime.mcp,
+        worktree_manager=runtime.worktree_manager,
     )

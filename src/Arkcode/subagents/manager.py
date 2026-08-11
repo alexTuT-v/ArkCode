@@ -12,6 +12,7 @@ from ..agents.events import RunResult
 from ..agents.identity import AgentIdentity
 from ..conversations import Conversation
 from ..permissions import Mode
+from ..tools.workspace import workspace_scope
 from .models import (
     BackgroundTask,
     EnvironmentPreparer,
@@ -73,12 +74,21 @@ class TaskManager:
                 if environment.reminder:
                     task_text = f"{environment.reminder}\n\n{task_text}"
                 job.status = JobStatus.RUNNING
-            result = await job.agent.run_to_completion(
-                job.conversation,
-                task_text,
-                job.mode,
-                job.cancel_event,
-            )
+            if environment is not None:
+                with workspace_scope(environment.workspace):
+                    result = await job.agent.run_to_completion(
+                        job.conversation,
+                        task_text,
+                        job.mode,
+                        job.cancel_event,
+                    )
+            else:
+                result = await job.agent.run_to_completion(
+                    job.conversation,
+                    task_text,
+                    job.mode,
+                    job.cancel_event,
+                )
             job.final_result = result
             job.status = status_from_run(result.status)
             job.result = result.final_text

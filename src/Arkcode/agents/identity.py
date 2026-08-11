@@ -65,4 +65,8 @@ def identity_scope(identity: AgentIdentity) -> Iterator[None]:
     try:
         yield
     finally:
-        _current_identity.reset(token)
+        try:
+            _current_identity.reset(token)
+        except ValueError:
+            # 生成器被跨上下文关闭时容忍丢失的 token。
+            pass

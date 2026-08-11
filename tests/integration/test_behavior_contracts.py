@@ -40,9 +40,10 @@ def test_builtin_slash_command_contract_is_stable() -> None:
         "resume",
         "review",
         "sandbox",
-        "session",
-        "status",
-    ]
+            "session",
+            "status",
+            "worktree",
+        ]
 
 
 def test_session_paths_are_stable(tmp_path: Path) -> None:

@@ -2,14 +2,17 @@
 
 import asyncio
 import contextlib
+import dataclasses
 import os
 import signal
+import tempfile
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
 from ..base import Result, Tool
 from ..utils import truncate
+from ..workspace import current_workspace
 
 if TYPE_CHECKING:
     from ...sandbox import Sandbox, SandboxConfig
@@ -74,6 +77,7 @@ class BashTool(Tool[Params]):
 
     async def execute(self, params: Params) -> Result:
         command = params.command
+        context = current_workspace()
 
         actual_command = command
         if (
@@ -81,9 +85,22 @@ class BashTool(Tool[Params]):
             and self.sandbox_config is not None
             and self.sandbox.available()
         ):
-            actual_command = self.sandbox.wrap(command, self.sandbox_config)
+            config = dataclasses.replace(
+                self.sandbox_config,
+                allow_write=[
+                    str(context.workspace_root),
+                    tempfile.gettempdir(),
+                ],
+                deny_write=[
+                    str(context.workspace_root / ".Arkcode" / "config.yaml"),
+                    str(context.workspace_root / ".Arkcode" / "permissions.local.yaml"),
+                    str(context.workspace_root / ".Arkcode" / "skills"),
+                ],
+            )
+            actual_command = self.sandbox.wrap(command, config)
 
         process_options: dict[str, Any] = {}
+        process_options["cwd"] = str(context.cwd)
         if os.name == "posix":
             process_options["start_new_session"] = True
         process = await asyncio.create_subprocess_shell(

@@ -17,6 +17,7 @@ from ...commands import (
     SessionCommands,
     SkillCommands,
     StatusQueries,
+    WorktreeCommands,
 )
 from ...commands.models import SandboxStatus
 from ...permissions import Mode
@@ -27,6 +28,7 @@ from ...sessions import (
 from ...sessions import (
     delete_session as delete_session_dir,
 )
+from ...tools.workspace import ExecutionPathContext
 from ..state import SessionState
 from ..views.messages import error_block, format_compact_notice
 
@@ -43,6 +45,7 @@ class CommandUIAdapter(
     SkillCommands,
     StatusQueries,
     SandboxCommands,
+    WorktreeCommands,
 ):
     """把命令所需的四类能力映射到 ArkCodeApp 与会话服务。"""
 
@@ -241,3 +244,67 @@ class CommandUIAdapter(
         engine = self._session.permissions
         if engine is not None:
             engine.sandbox_enabled = False
+
+    # ---- WorktreeCommands ----
+
+    async def create_worktree(self, slug: str) -> str:
+        manager = getattr(self._app, "worktree_manager", None)
+        if manager is None:
+            return "错误: Worktree 功能未启用"
+        worktree = await manager.create(slug, "HEAD", manual=True)
+        return f"已创建 Worktree: {worktree.path}（分支 {worktree.branch}）"
+
+    def list_worktrees(self) -> list[tuple[str, str, str, bool]]:
+        manager = getattr(self._app, "worktree_manager", None)
+        if manager is None:
+            return []
+        current = manager.current_session
+        return [
+            (
+                worktree.name,
+                str(worktree.path),
+                worktree.branch,
+                current is not None and current.worktree_name == worktree.name,
+            )
+            for worktree in manager.list()
+        ]
+
+    async def enter_worktree(self, slug: str) -> str:
+        manager = getattr(self._app, "worktree_manager", None)
+        if manager is None:
+            return "错误: Worktree 功能未启用"
+        session = await manager.enter(slug)
+        self._session.set_active_workspace(
+            ExecutionPathContext.at(session.worktree_path)
+        )
+        return f"已进入 Worktree: {session.worktree_name}（进程 cwd 未改变）"
+
+    async def exit_worktree(self, *, remove: bool, discard: bool) -> str:
+        manager = getattr(self._app, "worktree_manager", None)
+        if manager is None:
+            return "错误: Worktree 功能未启用"
+        current = manager.current_session
+        if current is None:
+            return "当前不在任何 Worktree 中"
+        from ...worktrees import ExitAction, ExitOptions
+
+        report = await manager.exit(
+            current.worktree_name,
+            ExitAction.REMOVE if remove else ExitAction.KEEP,
+            ExitOptions(discard_changes=discard),
+        )
+        self._session.set_active_workspace(None)
+        if report.removed:
+            return f"已退出并删除 Worktree {current.worktree_name}"
+        return f"已退出 Worktree {current.worktree_name}（保留）"
+
+    async def remove_worktree(self, slug: str, *, discard: bool) -> str:
+        manager = getattr(self._app, "worktree_manager", None)
+        if manager is None:
+            return "错误: Worktree 功能未启用"
+        from ...worktrees import ExitOptions
+
+        report = await manager.remove(slug, ExitOptions(discard_changes=discard))
+        if report.removed:
+            return f"已删除 Worktree {slug}"
+        return f"Worktree {slug} 未删除"

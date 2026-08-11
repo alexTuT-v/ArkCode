@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from ..base import Result, Tool
 from ..utils import truncate
+from ..workspace import Access, PathPermissionError, resolve_path
 
 _MAX_CHARS = 256 * 1024
 
@@ -35,7 +36,10 @@ class ReadFileTool(Tool[Params]):
         return "读取文本文件内容并返回带行号的结果。"
 
     async def execute(self, params: Params) -> Result:
-        path = Path(params.path)
+        try:
+            path = resolve_path(params.path, Access.READ)
+        except PathPermissionError as exc:
+            return Result(str(exc), is_error=True)
         if not path.exists():
             return Result(f"文件不存在: {path}", is_error=True)
         if path.is_dir():

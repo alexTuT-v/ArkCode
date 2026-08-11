@@ -683,10 +683,13 @@ async def test_agent_records_clean_read_file_content_before_next_iteration(
     conversation = Conversation()
     conversation.add_user("read")
 
-    await collect(
-        Agent(provider, registry, runtime=session_runtime),
-        conversation,
-    )
+    from Arkcode.tools.workspace import ExecutionPathContext, workspace_scope
+
+    with workspace_scope(ExecutionPathContext.at(tmp_path)):
+        await collect(
+            Agent(provider, registry, runtime=session_runtime),
+            conversation,
+        )
 
     record = session_runtime.recovery.snapshot()[0]
     assert record.path == str(path)

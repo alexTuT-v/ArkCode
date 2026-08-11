@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from ..subagents.catalog import Catalog
     from ..subagents.launcher import SubAgentLauncher
     from ..subagents.manager import TaskManager
+    from ..worktrees import WorktreeManager
 
 
 @dataclass
@@ -41,6 +42,8 @@ class ApplicationRuntime:
     task_manager: TaskManager | None = None
     approval_broker: ApprovalBroker | None = None
     launcher: SubAgentLauncher | None = None
+    worktree_manager: WorktreeManager | None = None
+    sweep_task: asyncio.Task[None] | None = None
 
     async def shutdown(self) -> None:
         """按 Session → Memory → SubAgent 任务 → 后台任务 → MCP 的顺序关闭。"""
@@ -52,4 +55,5 @@ class ApplicationRuntime:
         if self.approval_broker is not None:
             self.approval_broker.cancel_all()
         await close_background(self.cleanup_task)
+        await close_background(self.sweep_task)
         await close_mcp(self.mcp)

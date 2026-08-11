@@ -47,4 +47,7 @@ def parent_scope(context: ParentContext) -> Iterator[None]:
     try:
         yield
     finally:
-        _parent_context.reset(token)
+        try:
+            _parent_context.reset(token)
+        except ValueError:
+            pass

@@ -1,10 +1,10 @@
 """创建或覆盖文本文件。"""
 
-from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from ..base import Result, Tool
+from ..workspace import Access, PathPermissionError, resolve_path
 
 
 class Params(BaseModel):
@@ -25,7 +25,10 @@ class WriteFileTool(Tool[Params]):
         return "创建或覆盖文本文件，父目录不存在时自动创建。"
 
     async def execute(self, params: Params) -> Result:
-        path = Path(params.path)
+        try:
+            path = resolve_path(params.path, Access.WRITE)
+        except PathPermissionError as exc:
+            return Result(str(exc), is_error=True)
         content = params.content
         try:
             path.parent.mkdir(parents=True, exist_ok=True)

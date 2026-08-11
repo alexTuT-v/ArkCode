@@ -42,6 +42,7 @@ from ..sessions import (
 from ..sessions.record import CompactBoundary
 from ..skills import SkillExecutor, SkillLoader
 from ..tools import Registry
+from ..tools.workspace import ExecutionPathContext, workspace_scope
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,7 @@ class SessionService:
         catalog: Catalog | None = None,
         approval_broker: ApprovalBroker | None = None,
         launcher: SubAgentLauncher | None = None,
+        worktree_manager: object | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self._version = version
@@ -165,6 +167,8 @@ class SessionService:
         self.catalog: Catalog | None = catalog
         self.approval_broker: ApprovalBroker | None = approval_broker
         self.launcher: SubAgentLauncher | None = launcher
+        self.worktree_manager = worktree_manager
+        self.active_workspace: ExecutionPathContext | None = None
         self.runtime = runtime or SessionRuntime(
             recovery=RecoveryState(),
             auto_tracking=CompactCircuitBreaker(),
@@ -242,7 +246,12 @@ class SessionService:
         self._cancel = cancel
         self.conversation.add_user(text)
         try:
-            with parent_scope(self.parent_context()):
+            execution_context = self.active_workspace or ExecutionPathContext.at(
+                self.workspace
+            )
+            with workspace_scope(execution_context), parent_scope(
+                self.parent_context()
+            ):
                 async for event in agent.run(self.conversation, self.mode, cancel):
                     yield event
         finally:
@@ -272,6 +281,11 @@ class SessionService:
         """把系统提醒注入主 Agent 的 ReminderInbox，下一轮模型请求自然读取。"""
 
         self.runtime.inbox.append(text)
+
+    def set_active_workspace(self, context: ExecutionPathContext | None) -> None:
+        """切换后续主 Agent Run 的显式路径上下文（不改变进程 cwd）。"""
+
+        self.active_workspace = context
 
     async def force_compact(self) -> tuple[int, int]:
         """对当前会话执行一次手动压缩。"""

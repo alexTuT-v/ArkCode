@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from ..base import Result, Tool
 from ..utils import truncate
+from ..workspace import Access, PathPermissionError, resolve_path
 
 _MAX_SEARCHED_LINE_CHARS = 1_000_000
 _MAX_DISPLAY_LINE_CHARS = 2_000
@@ -165,7 +166,10 @@ class GrepTool(Tool[Params]):
         except re.error as exc:
             return Result(f"正则非法: {exc}", is_error=True)
 
-        root = Path(root_value)
+        try:
+            root = resolve_path(root_value, Access.READ)
+        except PathPermissionError as exc:
+            return Result(str(exc), is_error=True)
         if not root.exists():
             return Result(f"搜索路径不存在: {root}", is_error=True)
-        return await _search_in_subprocess(root_value, pattern, file_glob)
+        return await _search_in_subprocess(str(root), pattern, file_glob)

@@ -150,14 +150,29 @@ def end(input_tokens: int = 0, output_tokens: int = 0) -> StreamEnd:
     return StreamEnd("tool_use", input_tokens, output_tokens)
 
 
-def make_app(providers: list[ProviderConfig]) -> ArkCodeApp:
-    return ArkCodeApp(providers, "0.1.0", new_default_registry())
+def make_app(
+    providers: list[ProviderConfig],
+    *,
+    workspace: Path | None = None,
+) -> ArkCodeApp:
+    return ArkCodeApp(
+        providers,
+        "0.1.0",
+        new_default_registry(),
+        workspace=workspace,
+    )
 
 
 def make_permission_app(providers: list[ProviderConfig], root: Path) -> ArkCodeApp:
     engine, error = new_engine(str(root))
     assert error is None
-    return ArkCodeApp(providers, "0.1.0", new_default_registry(), engine)
+    return ArkCodeApp(
+        providers,
+        "0.1.0",
+        new_default_registry(),
+        engine,
+        workspace=root,
+    )
 
 
 async def wait_until_idle(
@@ -474,7 +489,7 @@ async def test_completion_filters_and_executes_highlighted_command(
         input_box.text = "/"
         await pilot.pause()
         assert app.completion.active is True
-        assert len(app.completion.items) == 15
+        assert len(app.completion.items) == 16
 
         input_box.text = "/s"
         await pilot.pause()
@@ -1113,7 +1128,7 @@ async def test_plan_then_do_switches_mode_and_executes_immediately(
         ]
     )
     monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
-    app = make_app([provider_config()])
+    app = make_app([provider_config()], workspace=tmp_path)
 
     async with app.run_test() as pilot:
         await app.submit("/plan")
@@ -1274,7 +1289,7 @@ async def test_full_tui_loop_reads_then_writes_across_iterations(
         ]
     )
     monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
-    app = make_app([provider_config()])
+    app = make_app([provider_config()], workspace=tmp_path)
 
     async with app.run_test() as pilot:
         await app.submit("读取 source.md 后写入 summary.txt")
@@ -1367,7 +1382,7 @@ async def test_concurrent_tool_batch_scrollback_preserves_model_order(
         ]
     )
     monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
-    app = make_app([provider_config()])
+    app = make_app([provider_config()], workspace=tmp_path)
 
     async with app.run_test() as pilot:
         await app.submit("并发读取两个文件后写入")

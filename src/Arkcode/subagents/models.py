@@ -12,6 +12,7 @@ from ..agents.events import RunResult, RunStatus, Usage
 from ..agents.identity import AgentIdentity
 from ..conversations import Conversation
 from ..permissions import Mode
+from ..tools.workspace import ExecutionPathContext
 
 
 class Source(Enum):
@@ -165,7 +166,7 @@ class EnvironmentPreparer(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class PreparedEnvironment:
-    workspace: Any
+    workspace: ExecutionPathContext
     reminder: str
 
 

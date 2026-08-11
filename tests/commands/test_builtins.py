@@ -6,7 +6,24 @@ from Arkcode.commands import CommandKind, CommandRegistry, register_builtins
 from Arkcode.commands.dispatcher import dispatch
 from Arkcode.permissions import Mode
 
-from .fakes import make_context
+from .fakes import FakeSession, FakeSkills, FakeStatus, FakeUI, make_context
+
+
+class FakeWorktree:
+    async def create_worktree(self, slug: str) -> str:
+        return f"已创建 {slug}"
+
+    def list_worktrees(self) -> list[tuple[str, str, str, bool]]:
+        return [("alice", "/wt/alice", "worktree-alice", False)]
+
+    async def enter_worktree(self, slug: str) -> str:
+        return f"已进入 {slug}"
+
+    async def exit_worktree(self, *, remove: bool, discard: bool) -> str:
+        return f"退出 remove={remove} discard={discard}"
+
+    async def remove_worktree(self, slug: str, *, discard: bool) -> str:
+        return f"已删除 {slug} discard={discard}"
 
 
 def builtins() -> CommandRegistry:
@@ -15,7 +32,7 @@ def builtins() -> CommandRegistry:
     return registry
 
 
-def test_registers_exactly_fourteen_visible_commands() -> None:
+def test_registers_exactly_fifteen_visible_commands() -> None:
     registry = builtins()
     assert [item.name for item in registry.visible()] == [
         "clear",
@@ -32,12 +49,47 @@ def test_registers_exactly_fourteen_visible_commands() -> None:
         "sandbox",
         "session",
         "status",
+        "worktree",
     ]
     assert {item.kind for item in registry.visible()} == {
         CommandKind.LOCAL,
         CommandKind.UI,
         CommandKind.PROMPT,
     }
+
+
+@pytest.mark.asyncio
+async def test_worktree_commands_route_to_port() -> None:
+    from Arkcode.commands import CommandContext
+
+    registry = builtins()
+    ui = FakeUI()
+    session = FakeSession()
+    worktree = FakeWorktree()
+
+    context = CommandContext(
+        args="create alice",
+        session=session,
+        skills=FakeSkills(),
+        status=FakeStatus(),
+        ui=ui,
+        sandbox=session,
+        worktree=worktree,  # type: ignore[arg-type]
+    )
+    assert await dispatch(registry, "worktree", context)
+    assert "已创建 alice" in ui.lines[-1]
+
+    listed = CommandContext(
+        args="list",
+        session=session,
+        skills=FakeSkills(),
+        status=FakeStatus(),
+        ui=ui,
+        sandbox=session,
+        worktree=worktree,  # type: ignore[arg-type]
+    )
+    assert await dispatch(registry, "worktree", listed)
+    assert "alice" in ui.lines[-1]
 
 
 @pytest.mark.asyncio

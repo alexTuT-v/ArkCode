@@ -1,10 +1,10 @@
 """通过唯一原文匹配精确编辑文件。"""
 
-from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from ..base import Result, Tool
+from ..workspace import Access, PathPermissionError, resolve_path
 
 
 class Params(BaseModel):
@@ -29,7 +29,10 @@ class EditFileTool(Tool[Params]):
         )
 
     async def execute(self, params: Params) -> Result:
-        path = Path(params.path)
+        try:
+            path = resolve_path(params.path, Access.WRITE)
+        except PathPermissionError as exc:
+            return Result(str(exc), is_error=True)
         old_string = params.old_string
         new_string = params.new_string
         try:

@@ -1,11 +1,11 @@
 """按 glob 模式查找文件。"""
 
 import asyncio
-from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from ..base import Result, Tool
+from ..workspace import Access, PathPermissionError, resolve_path
 
 
 class Params(BaseModel):
@@ -29,7 +29,10 @@ class GlobTool(Tool[Params]):
         pattern = params.pattern
         root_value = params.path or "."
 
-        root = Path(root_value)
+        try:
+            root = resolve_path(root_value, Access.READ)
+        except PathPermissionError as exc:
+            return Result(str(exc), is_error=True)
         if not root.is_dir():
             return Result(f"搜索目录不存在: {root}", is_error=True)
         matches: list[str] = []
@@ -37,6 +40,12 @@ class GlobTool(Tool[Params]):
         try:
             for index, path in enumerate(root.glob(pattern), 1):
                 if path.is_file():
+                    try:
+                        real = resolve_path(str(path), Access.READ)
+                    except PathPermissionError:
+                        continue
+                    if real != path.resolve():
+                        path = real
                     if len(matches) == 100:
                         truncated = True
                         break

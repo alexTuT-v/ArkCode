@@ -22,6 +22,7 @@ from .ports import (
     SessionCommands,
     SkillCommands,
     StatusQueries,
+    WorktreeCommands,
 )
 from .registry import CommandRegistry
 
@@ -38,6 +39,7 @@ __all__ = [
     "SessionCommands",
     "SkillCommands",
     "StatusQueries",
+    "WorktreeCommands",
     "dispatch",
     "parse",
     "register_builtins",

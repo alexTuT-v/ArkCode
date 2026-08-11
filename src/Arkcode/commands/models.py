@@ -12,6 +12,7 @@ from .ports import (
     SessionCommands,
     SkillCommands,
     StatusQueries,
+    WorktreeCommands,
 )
 
 
@@ -31,6 +32,7 @@ class CommandContext:
     status: StatusQueries
     ui: CommandUI
     sandbox: SandboxCommands
+    worktree: WorktreeCommands = field(default_factory=lambda: _NullWorktreeCommands())
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +54,25 @@ class SandboxStatus:
 
 
 Handler = Callable[[CommandContext], Awaitable[None]]
+
+
+class _NullWorktreeCommands:
+    """未装配 Worktree 时用的默认实现。"""
+
+    async def create_worktree(self, slug: str) -> str:
+        return "错误: Worktree 功能未启用"
+
+    def list_worktrees(self) -> list[tuple[str, str, str, bool]]:
+        return []
+
+    async def enter_worktree(self, slug: str) -> str:
+        return "错误: Worktree 功能未启用"
+
+    async def exit_worktree(self, *, remove: bool, discard: bool) -> str:
+        return "错误: Worktree 功能未启用"
+
+    async def remove_worktree(self, slug: str, *, discard: bool) -> str:
+        return "错误: Worktree 功能未启用"
 
 
 @dataclass(slots=True)

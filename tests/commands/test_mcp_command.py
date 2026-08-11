@@ -21,7 +21,8 @@ def test_builtins_now_include_mcp() -> None:
     names = [item.name for item in registry.visible()]
 
     assert "mcp" in names
-    assert names[-1] == "status"
+    assert names[-2] == "status"
+    assert names[-1] == "worktree"
     assert registry.lookup("mcp").kind is CommandKind.LOCAL
 
 
