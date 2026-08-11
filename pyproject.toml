@@ -13,6 +13,7 @@ dependencies = [
   "httpx>=0.27",
   "mcp>=1.0",
   "openai>=1.50",
+  "pydantic>=2",
   "python-dotenv>=1.0",
   "PyYAML>=6.0",
   "rich>=13",
@@ -20,7 +21,7 @@ dependencies = [
 ]
 
 [project.scripts]
-Arkcode = "Arkcode.cli:main"
+Arkcode = "Arkcode.application.cli:main"
 
 [dependency-groups]
 dev = [

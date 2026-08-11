@@ -1,0 +1,124 @@
+# Eino 框架概览（查询自 Context7 官方文档 cloudwego.io/docs/eino）
+
+**Eino** 是字节跳动（CloudWeGo）开源的、基于 **Go** 语言的 AI 应用开发框架（Agent Development Kit），官方文档位于 `cloudwego.io/docs/eino`。
+
+**核心目标**：简化可扩展、可维护的 AI 应用开发，覆盖模型抽象、能力组合、编排（orchestration）和运行时支持。
+
+**快速开始**：
+
+```bash
+# 1. 安装
+go get github.com/cloudwego/eino@latest
+
+# 2. 克隆官方示例仓库
+git clone https://github.com/cloudwego/eino-examples.git
+cd eino-examples/quickstart/chatwitheino
+```
+
+**核心模块**：
+- **ChatModel & Message**：聊天模型与消息抽象
+- **Chain / Graph 编排**：通过 `compose.NewGraph` 构建节点图，支持 `AddChatTemplateNode`、`AddChatModelNode`、`AddEdge`，编译后支持 `Invoke`（一次性调用）和 `Stream`（流式输出）
+- **Eino ADK**：Agent 开发套件，内置 Agent 快速开始模板
+
+文档还提供了大量进阶模块（Agent、多 Agent 系统、DevOps 工具等）。
+
+---
+
+## 示例：Build and Invoke a Graph in Eino
+
+来源：https://www.cloudwego.io/docs/eino/core_modules/chain_and_graph_orchestration/chain_graph_introduction
+
+Defines a graph with prompt and model nodes, compiles it, and invokes it to get a response. Includes a mock chat model for demonstration. Use this to set up basic orchestration flows.
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "io"
+
+    "github.com/cloudwego/eino/components/model"
+    "github.com/cloudwego/eino/components/prompt"
+    "github.com/cloudwego/eino/compose"
+    "github.com/cloudwego/eino/schema"
+)
+
+const (
+    nodeOfModel  = "model"
+    nodeOfPrompt = "prompt"
+)
+
+func main() {
+    ctx := context.Background()
+    g := compose.NewGraph[map[string]any, *schema.Message]()
+
+    pt := prompt.FromMessages(
+       schema.FString,
+       schema.UserMessage("what's the weather in {location}?"),
+    )
+
+    _ = g.AddChatTemplateNode(nodeOfPrompt, pt)
+    _ = g.AddChatModelNode(nodeOfModel, &mockChatModel{}, compose.WithNodeName("ChatModel"))
+    _ = g.AddEdge(compose.START, nodeOfPrompt)
+    _ = g.AddEdge(nodeOfPrompt, nodeOfModel)
+    _ = g.AddEdge(nodeOfModel, compose.END)
+
+    r, err := g.Compile(ctx)
+    if err != nil {
+       panic(err)
+    }
+
+    in := map[string]any{"location": "beijing"}
+    ret, err := r.Invoke(ctx, in)
+    fmt.Println("invoke result: ", ret)
+
+    // stream
+    s, err := r.Stream(ctx, in)
+    if err != nil {
+       panic(err)
+    }
+
+    defer s.Close()
+    for {
+       chunk, err := s.Recv()
+       if err != nil {
+          if err == io.EOF {
+             break
+          }
+          panic(err)
+       }
+
+       fmt.Println("stream chunk: ", chunk)
+    }
+}
+
+type mockChatModel struct{}
+
+func (m *mockChatModel) Generate(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+    return schema.AssistantMessage("the weather is good", nil), nil
+}
+
+func (m *mockChatModel) Stream(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+    sr, sw := schema.Pipe[*schema.Message](0)
+    go func() {
+       defer sw.Close()
+       sw.Send(schema.AssistantMessage("the weather is", nil), nil)
+       sw.Send(schema.AssistantMessage("good", nil), nil)
+    }()
+    return sr, nil
+}
+
+func (m *mockChatModel) BindTools(tools []*schema.ToolInfo) error {
+    panic("implement me")
+}
+```
+
+---
+
+## 相关文档链接
+
+- Eino 框架介绍：https://www.cloudwego.io/docs/eino/quick_start/chapter_01_chatmodel_and_message
+- 快速开始：https://www.cloudwego.io/docs/eino/overview/eino_open_source
+- Chain/Graph 编排：https://www.cloudwego.io/docs/eino/core_modules/chain_and_graph_orchestration/chain_graph_introduction
+- Eino ADK Agent 快速开始：https://www.cloudwego.io/docs/eino/core_modules/eino_adk/agent_quickstart

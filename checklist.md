@@ -1,267 +1,192 @@
-# Skill 系统 Checklist
+# SubAgent、Worktree 与 Agent Team Unified Checklist
 
-> 每项必须通过运行代码、测试或真实 TUI 观察获得证据后才能勾选。代码重构但行为不变时，
-> 行为项仍应成立。操作目录为仓库根 `/Users/inception/learning/ArkCode`。
+> 每项都必须通过运行命令或观察行为获得证据。不得仅以“代码已实现”判定通过；验收报告需记录实际输出、通过/失败/跳过数量和必要的复现步骤。
 
-## 1. SkillMeta 与解析
+## 0. 验收前置条件
 
-- [x] 合法 `SKILL.md` 能解析出 name、description 和完整正文（验证：
-  `pytest -q tests/test_skills_parser.py -k defaults`）
-- [x] 元数据类型统一命名为 `SkillMeta`，公开接口没有旧类型名（验证：
-  `rg "class SkillMeta" src/Arkcode/skills && ! rg "class SkillD[e]f" src/Arkcode`）
-- [x] `mode` 缺省为 `inline`，`context` 缺省为 `full`（验证：Parser 默认值测试）
-- [x] `mode` 只接受 `inline/fork`，`context` 只接受 `full/recent/none`（验证：非法枚举
-  表驱动测试）
-- [x] name 只接受 `^[a-z][a-z0-9-]*$`，name/description 缺失或为空时拒绝（验证：
-  Parser 校验测试）
-- [x] 缺少 opening delimiter、缺少 closing delimiter、非法 YAML、YAML 根节点非 mapping
-  均产生 `SkillParseError`（验证：Parser 错误测试）
-- [x] 不存在的源文件产生可识别解析错误，不泄漏无关异常（验证：nonexistent 测试）
-- [x] 单文件布局把 `is_directory` 设为 False，目录型 `SKILL.md` 设为 True（验证：两种
-  布局测试）
-- [x] `source_path` 是实际 `SKILL.md/*.md` 的绝对路径（验证：路径断言测试）
-- [x] `$ARGUMENTS` 的每次出现都会被替换（验证：multiple placeholders 测试）
-- [x] 正文没有 `$ARGUMENTS` 时，即使提供 args 也逐字保持不变（验证：no placeholder 测试）
+- [ ] 三份规格、统一 Plan 和 50 个 Tasks 均为当前批准版本。（验证：核对 `spec_sub_agent.md`、`spec_worktree.md`、`spec_agent_team.md`、`plan.md`、`task.md` 的工作区版本）
+- [ ] 阶段 A、B、C 的回归门 T17、T29、T50 均已有退出码为 0 的记录。（验证：查看对应执行日志）
+- [ ] 测试未依赖真实用户配置或污染主仓库。（验证：测试均使用临时 HOME、临时 Git 仓库和独立 session 目录）
 
-## 2. 两级加载、优先级与热重载
+## 1. SubAgent 验收
 
-- [x] 项目 `.Arkcode/skills/*.md` 可被加载（验证：Loader project file 测试）
-- [x] 项目 `.Arkcode/skills/*/SKILL.md` 可被加载且目录资源不被误当成独立 Skill
-  （验证：Loader directory 测试）
-- [x] 用户 `~/.Arkcode/skills/` 的两种布局均可加载（验证：monkeypatch home 的 user 测试）
-- [x] 项目与用户出现同名 Skill 时只保留项目版本（验证：project overrides user 测试）
-- [x] Catalog 始终按 name 字典序返回，且只含 name/description（验证：catalog 测试）
-- [x] `get_source_label` 对项目、用户、未知 Skill 分别返回 project、user、None（验证：
-  source label 测试）
-- [x] 单条坏 Skill 只记录 warning，其他合法 Skill 继续加载（验证：`caplog` 隔离测试）
-- [x] `get(name)` 每次重读磁盘，修改正文后无需 reload/restart 即时生效（验证：hot reload
-  success 测试）
-- [x] 热重读失败时返回最后一次成功缓存并记录 warning（验证：hot reload fallback 测试）
-- [x] `reload()` 能发现新增 Skill、移除已删除 Skill，并刷新 Catalog（验证：reload 测试）
-- [x] 缺少项目目录或用户目录时返回空结果，不抛异常（验证：missing directories 测试）
+### 工具、角色和 Fork
 
-## 3. Catalog、Active Skills 与 Agent
+- [ ] **SubAgent AC1**：主 Agent 始终看到稳定 Agent schema；定义式子 Agent 看不到 Agent，Fork 只保留 schema 且执行被拒绝。（验证：运行 `pytest tests/subagents/test_filter.py -v`）
+- [ ] **SubAgent AC2**：调用 `subagent_type="explore"` 返回 explore 的最终 assistant 文本。（验证：运行 `pytest tests/subagents/test_tools.py -k explore -v`）
+- [ ] **SubAgent AC3**：未知角色返回结构化“未知 subagent_type”错误。（验证：运行 `pytest tests/subagents/test_tools.py -k unknown -v`）
+- [ ] **SubAgent AC4**：不传 subagent_type 时首条任务含 `<fork_boilerplate>`，父历史前缀不变。（验证：运行 `pytest tests/subagents/test_launcher.py -k fork_prefix -v`）
+- [ ] **SubAgent AC5**：Fork 内调用 Agent 被来源防线拒绝，结果明确说明不能嵌套启动。（验证：运行 `pytest tests/subagents/test_launcher.py -k fork_nested -v`）
+- [ ] **SubAgent AC6**：定义式子 Agent 的可见工具中没有 Agent。（验证：运行 `pytest tests/subagents/test_filter.py -k defined -v`）
+- [ ] **SubAgent AC16**：项目级 `explore.md` 覆盖 builtin explore。（验证：运行 `pytest tests/subagents/test_catalog.py -k project_override -v`）
+- [ ] **SubAgent AC19**：即使来源识别失效，历史中的 `<fork_boilerplate>` 仍阻止嵌套 Agent。（验证：运行 `pytest tests/subagents/test_launcher.py -k boilerplate_guard -v`）
+- [ ] **SubAgent AC21**：自定义角色的 tools、permissionMode、maxTurns 和追加式 instructions 全部生效，基础 system prompt 保留。（验证：运行 `pytest tests/subagents/test_launcher.py -k custom_definition -v`）
+- [ ] **SubAgent AC22**：`explore-v2` 合法；`Explore/foo_bar/foo bar` 和非法字段文件 warning 后跳过；Provider 创建失败不回退。（验证：运行 `pytest tests/subagents/test_models.py tests/subagents/test_catalog.py tests/subagents/test_launcher.py -k 'invalid or provider' -v`）
 
-- [x] Available Skills 只列 name/description 和 LoadSkill 指引，不包含任何完整 SOP（验证：
-  `pytest -q tests/test_prompt_skills.py -k catalog`）
-- [x] 没有 Skill 时不输出空的 Available Skills 标题（验证：empty catalog 测试）
-- [x] 激活 Skill 后 environment 出现 `## Active Skills`、Skill 名和完整 SOP（验证：active
-  render 测试）
-- [x] Active Skills 为空时 environment 不出现对应标题（验证：empty active 测试）
-- [x] 同名 Skill 重复激活会原位置更新正文，不产生重复段（验证：reactivate 测试）
-- [x] 同时激活多个 Skill 时保持激活顺序（验证：ordering 测试）
-- [x] Agent iteration N 内调用 LoadSkill 后，iteration N+1 的 system.environment 立即包含
-  SOP（验证：`pytest -q tests/test_agent.py -k skill_iteration`）
-- [x] 动态 Skill 正文不进入稳定 system block（验证：捕获 Request.system 的断言）
-- [x] `clear_active_skills()` 清空 Active Skills，但不改变 Catalog（验证：Agent clear 测试）
+### 权限与审批
 
-## 4. LoadSkill 工具
+- [ ] **SubAgent AC7**：`permissionMode:dontAsk` 放行普通 Ask 操作，但系统 deny 仍不可绕过。（验证：运行 `pytest tests/permissions/test_permission_core.py -k dont -v`）
+- [ ] **SubAgent AC8**：默认模式 Ask 会暂停对应子 Agent，TUI 审批标明来源且响应只恢复该 Agent。（验证：运行 `pytest tests/subagents/test_launcher.py -k approval -v`）
 
-- [x] Tool Registry 中可按精确名字 `LoadSkill` 找到工具（验证：工具注册集成测试）
-- [x] LoadSkill 的 JSON Schema 只要求字符串字段 `name`（验证：schema 测试）
-- [x] LoadSkill 被判定为 read-only，Plan Mode 可见且不进入权限确认（验证：Registry
-  read-only definitions + Agent permission 测试）
-- [x] Loader/Agent 尚未注入时返回 `is_error=True` 和初始化错误（验证：uninitialized 测试）
-- [x] 非法 JSON、缺 name、name 非字符串均返回可观察错误（验证：参数表驱动测试）
-- [x] 未知 Skill 返回错误并列出可用名称，不激活任何内容（验证：unknown 测试）
-- [x] 成功调用会热重读并调用 `activate_skill(name, body)`（验证：mock 调用断言）
-- [x] 成功结果只含简短确认，不包含完整 SOP（验证：结果内容断言）
-- [x] `Registry.without({"LoadSkill"})` 不包含 LoadSkill、保持其他工具顺序，且不修改源
-  Registry（验证：Tool Registry 隔离测试）
+### 后台 Job 生命周期
 
-## 5. inline 与 fork 执行
+- [ ] **SubAgent AC9**：显式后台调用立即返回 `{job_id,status:"async_launched"}`，主 Agent 不阻塞。（验证：运行 `pytest tests/subagents/test_tools.py -k async_launched -v`）
+- [ ] **SubAgent AC10**：前台运行达到 120 秒后同一执行切到后台并返回 `timed_out_to_background`。（验证：运行 `pytest tests/subagents/test_manager.py -k timeout_background -v`）
+- [ ] **SubAgent AC11**：ESC 把前台子 Agent 切到后台，TUI 可继续接收输入且底层 task 未取消。（验证：运行 `pytest tests/subagents/test_manager.py tests/tui/test_tui.py -k esc -v`）
+- [ ] **SubAgent AC12**：后台完成后下一轮 reminder 出现 `<task-notification>` 和 Result。（验证：运行 `pytest tests/subagents/test_tools.py -k notification -v`）
+- [ ] **SubAgent AC13**：JobList 返回 job_id/name/status/tool_count/last_activity。（验证：运行 `pytest tests/subagents/test_tools.py -k job_list -v`）
+- [ ] **SubAgent AC14**：JobGet 返回结果；JobStop 后状态为 cancelled。（验证：运行 `pytest tests/subagents/test_tools.py -k 'job_get or job_stop' -v`）
+- [ ] **SubAgent AC15**：JobSend 复用已结束 Agent/Conversation，创建新 job_id 并产生新 `<task-notification>`。（验证：运行 `pytest tests/subagents/test_manager.py -k resume -v`）
+- [ ] **SubAgent AC18**：关闭后台功能时 Fork 返回结构化错误，不偷偷转前台。（验证：运行 `pytest tests/subagents/test_tools.py -k background_disabled -v`）
+- [ ] **SubAgent AC20**：普通异常进入 failed 并通知；取消单独进入 cancelled；主程序继续运行。（验证：运行 `pytest tests/subagents/test_manager.py -k 'failed or cancelled' -v`）
+- [ ] **SubAgent AC20a**：Worktree 后台 Job 可观察 preparing→running→终态，准备失败、取消和清理结果只通知一次。（验证：运行 `pytest tests/integration/test_subagent_worktree.py -k lifecycle -v`）
 
-### inline
+### Skill 集成
 
-- [x] inline 执行替换 `$ARGUMENTS` 后激活对应 Skill（验证：
-  `pytest -q tests/test_skills_executor.py -k inline`）
-- [x] inline 正文无占位符时保持原样（验证：inline no-placeholder 测试）
-- [x] inline Executor 自身不调用 Provider、不修改 Conversation（验证：mock 与历史断言）
-- [x] inline Slash handler 激活后只触发一个主 Agent 用户回合（验证：Command/TUI 集成测试）
+- [ ] **SubAgent AC17**：Skill fork 复用统一 Launcher/TaskManager，不存在第二套 Agent 构造路径。（验证：运行 `pytest tests/skills/test_skills_executor.py -k fork -v`）
 
-### fork
+## 2. Worktree 验收
 
-- [x] `context=none` 的子 Conversation 只含渲染后的 Skill 请求（验证：fork none 测试）
-- [x] `context=recent` 只携带最近 5 条 user/assistant 消息，不携带 tool 消息（验证：fork
-  recent 测试）
-- [x] `context=full` 先生成历史摘要，再追加 Skill 请求（验证：fork full 测试）
-- [x] fork 使用独立 Conversation、SessionRuntime、compact/recovery/session 状态（验证：
-  对象身份与主状态前后对比）
-- [x] fork Agent 看不到 LoadSkill，但其他允许工具仍保持原注册顺序（验证：fork registry 测试）
-- [x] 未配置 model 时沿用当前 ProviderConfig，配置 model 时只替换 model（验证：provider
-  factory mock）
-- [x] fork 累计 AgentEvent.text 直到 done，并返回完整文本（验证：事件序列测试）
-- [x] fork 普通异常返回 `[skill <name> failed: ...]`，CancelledError 保持取消语义（验证：
-  error/cancel 测试）
-- [x] fork 执行前后主 Conversation 和主 Agent Active Skills 完全不变（验证：隔离测试）
-- [x] fork 完成后主会话只新增一条 `<system-reminder>` 回流结果，子执行过程不回流（验证：
-  TUI fork integration 测试）
+### 标识、创建和恢复
 
-## 6. Slash Command 与管理命令
+- [ ] **Worktree AC1**：`feature/a` 合法，traversal、空段和尾随空格被拒绝。（验证：运行 `pytest tests/worktrees/test_slug.py -v`）
+- [ ] **Worktree AC2**：创建 alice 后目录为 `.Arkcode/worktrees/alice/`、分支为 `worktree-alice`。（验证：运行 `pytest tests/worktrees/test_manager.py -k create_simple -v`）
+- [ ] **Worktree AC3**：嵌套 slug `team/alice` flatten 为目录/分支中的 `team+alice`。（验证：运行 `pytest tests/worktrees/test_manager.py -k create_nested -v`）
+- [ ] **Worktree AC4**：身份完全匹配时快速恢复且不调 git add；manifest 缺失/损坏时 fail-closed 且不改资源。（验证：运行 `pytest tests/worktrees/test_manifest.py tests/worktrees/test_manager.py -k recover -v`）
 
-- [x] Parser 能把 `/skill info review` 分为 name=`skill`、args=`info review`（验证：
-  `pytest -q tests/test_command_dispatch.py -k arguments`）
-- [x] 普通文本、空白、空 `/`、大小写命令和内部多空格按 Plan 分类（验证：parse 表驱动测试）
-- [x] 原有 12 条命令在 Handler 增加 args 后行为保持不变（验证：既有 command/TUI 测试）
-- [x] Registry 默认仍在 name/alias 冲突时立即失败（验证：既有冲突测试）
-- [x] `replace=True` 能覆盖旧命令并清理旧 aliases/visible 索引（验证：replace 测试）
-- [x] Registry clear 后 lookup/visible/prefix_match 全部为空（验证：clear 测试）
-- [x] `/skill` 与 `/skill list` 按 name 排序显示 name、description、project/user 来源（验证：
-  管理命令测试）
-- [x] `/skill info <name>` 显示规范化 frontmatter、绝对 source path 和目录型标记（验证：
-  info 测试）
-- [x] `/skill reload` 刷新 Loader、Slash Registry 和 Agent Catalog，不触发 LLM（验证：
-  reload 集成测试）
-- [x] `/skill` 非法子命令打印用法，不触发 LLM（验证：invalid usage 测试）
-- [x] 每个 Skill 自动成为 `/name` 命令，描述末尾包含 `[skill]`（验证：动态注册测试）
-- [x] 动态 Skill handler 每次调用 Loader.get，因此无需 reload 即可读取正文修改（验证：
-  command hot reload 测试）
-- [x] Skill 名与 `/review` 等内置命令冲突时 Skill 优先（验证：override 测试）
-- [x] 删除冲突 Skill 并 reload 后，被覆盖的内置命令恢复（验证：restore builtin 测试）
-- [x] `/help` 与补全菜单随 install/reload 即时新增或移除 Skill（验证：TUI integration 测试）
+### 创建后三步设置
 
-## 7. `/clear` 与生命周期
+- [ ] **Worktree AC5**：本地 Arkcode 配置文件被复制到 Worktree 对应位置。（验证：运行 `pytest tests/worktrees/test_setup.py -k config -v`）
+- [ ] **Worktree AC6**：setup 不探测 `.husky/`、不调用或修改 `core.hooksPath`。（验证：运行 `pytest tests/worktrees/test_setup.py -k hooks -v`，并比较创建前后 Git config）
+- [ ] **Worktree AC7**：有只读保障时共享依赖可读不可写；无保障时跳过并 warning。（验证：运行 `pytest tests/worktrees/test_setup.py -k readonly -v`）
+- [ ] **Worktree AC8**：`.worktreeinclude` 命中的 ignored `.env` 被复制。（验证：运行 `pytest tests/worktrees/test_setup.py -k include -v`）
 
-- [x] App 初始化时加载 Loader，并在 Agent 创建前注册 LoadSkill（验证：TUI construction 测试）
-- [x] Provider 激活后完成 LoadSkill Agent 注入、Executor 构造和 Catalog 设置（验证：provider
-  activation 测试）
-- [x] 多 Provider 选择路径与单 Provider 自动激活路径都能完成 Skills 组装（验证：两类 TUI
-  测试）
-- [x] `/clear` 成功创建新会话后清除 Active Skills，Catalog 保留（验证：clear integration）
-- [x] 新会话创建失败时旧 Conversation、Active Skills 和 Writer 保持可用（验证：clear failure）
-- [x] fork 后台任务由 App 持有，完成后从集合移除（验证：task lifecycle 测试）
-- [x] App 退出时取消并等待未完成 fork tasks，无 pending-task warning（验证：unmount 测试）
-- [x] Skill 相关本地命令和管理命令不增加 token 计数（验证：TUI usage 前后对比）
+### cwd、路径与工具隔离
 
-## 8. 远程安装安全
+- [ ] **Worktree AC9**：enter 返回完整 session 且不改变 `Path.cwd()`。（验证：运行 `pytest tests/worktrees/test_manager.py -k enter -v`）
+- [ ] **Worktree AC9a**：exit/remove/auto_cleanup 前后 `Path.cwd()` 均不变。（验证：运行 `pytest tests/worktrees/test_manager.py -k cwd -v`）
+- [ ] **Worktree AC13**：六个核心工具按注入 cwd 解析相对路径。（验证：运行 `pytest tests/tools/test_workspace_context.py -k relative -v`）
+- [ ] **Worktree AC14**：Bash subprocess 的 cwd 精确等于 ExecutionPathContext.cwd。（验证：运行 `pytest tests/tools/test_workspace_context.py -k bash_cwd -v`）
+- [ ] **Worktree AC14a**：父仓库绝对路径、`../` 和未声明 symlink target 被拒绝；Worktree 内绝对路径允许。（验证：运行 `pytest tests/tools/test_workspace_context.py -k containment -v`）
 
-- [x] 接受 `https://skills.sh/<owner>/<repo>/<skill>`（验证：URL parser 测试）
-- [x] 接受 `https://github.com/<owner>/<repo>/tree/<ref>/<path>`（验证：URL parser 测试）
-- [x] 接受指向 SKILL.md 的 `https://raw.githubusercontent.com/...`（验证：URL parser 测试）
-- [x] 拒绝 HTTP、未知 host、缺 owner/repo/ref/path 和非 SKILL.md raw URL（验证：invalid URL
-  表驱动测试）
-- [x] 下载只访问 GitHub Contents API，不调用本地 git、不解压 ZIP（验证：MockTransport 请求
-  URL 与代码扫描）
-- [x] 单文件超过 1 MiB 时在落盘前拒绝（验证：file-size limit 测试）
-- [x] 总大小超过 8 MiB 时拒绝并清理 staging（验证：total-size limit 测试）
-- [x] 文件数超过 64 时拒绝并清理 staging（验证：file-count limit 测试）
-- [x] 递归深度超过 4 时拒绝并清理 staging（验证：depth limit 测试）
-- [x] base64 非法、API 错误、未知节点类型和路径逃逸均拒绝（验证：安全错误测试）
-- [x] 缺 SKILL.md 或下载后的 SKILL.md 解析失败时拒绝（验证：post-download validation）
-- [x] 目标 Skill 目录已存在时不覆盖任何文件（验证：existing target 测试）
-- [x] 成功安装只通过同文件系统 atomic rename 暴露完整目录（验证：rename spy + 文件断言）
-- [x] 任意失败不留下 staging 或半安装目标（验证：参数化 cleanup 测试）
-- [x] 如果环境已有 GITHUB_TOKEN 则作为认证使用；缺失时仍支持公共仓库（验证：header 测试）
+### 退出、清理和 Session
 
-## 9. InstallSkill 工具与热注册
+- [ ] **Worktree AC10**：存在未提交修改时普通 remove 抛错并保留目录。（验证：运行 `pytest tests/worktrees/test_manager.py -k changed_refuse -v`）
+- [ ] **Worktree AC11**：显式 discard 删除目录、分支和 manifest。（验证：运行 `pytest tests/worktrees/test_manager.py -k discard -v`）
+- [ ] **Worktree AC12**：manual Worktree 永远 keep；临时干净 Worktree 自动 remove。（验证：运行 `pytest tests/worktrees/test_manager.py -k auto_cleanup -v`）
+- [ ] **Worktree AC17**：`/worktree create/list` 可创建并显示 alice。（验证：运行 `pytest tests/commands/test_builtins.py -k worktree -v`）
+- [ ] **Worktree AC18**：`/worktree exit --remove` 有修改时报错，追加 `--discard` 后删除。（验证：运行命令测试并在临时 Git 仓库手动复现）
+- [ ] **Worktree AC19**：stale sweep 只处理合法临时命名和超过 cutoff 的实例，并跳过当前、有变更或未推送 commit 的实例。（验证：运行 `pytest tests/worktrees/test_manager.py -k stale -v`）
+- [ ] **Worktree AC20**：session 可恢复；外部删除目录后启动会清空 session 并 warning。（验证：运行 `pytest tests/worktrees/test_manager.py -k session -v`）
 
-- [x] Tool Registry 中可按精确名字 `InstallSkill` 找到工具（验证：工具注册测试）
-- [x] InstallSkill Schema 只要求字符串字段 `url`（验证：schema 测试）
-- [x] InstallSkill 是 write 工具，默认权限模式会进入审批，Plan Mode 拒绝执行（验证：权限
-  集成测试）
-- [x] 非法 JSON/URL 和网络/安装失败返回 `is_error=True`（验证：Tool 错误测试）
-- [x] 安装成功后依次 reload Loader、调用 on_installed 并返回 Skill 名（验证：mock 顺序断言）
-- [x] on_installed 失败时不报告假成功（验证：callback failure 测试）
-- [x] 安装完成无需重启，Agent Catalog、`/help` 与补全同时出现新 Skill（验证：TUI 集成测试）
+### SubAgent 与 Worktree 集成
 
-## 10. 编译、静态检查与测试
+- [ ] **Worktree AC15**：`isolation:"worktree"` 自动执行 create→notice→cwd→run→cleanup。（验证：运行 `pytest tests/integration/test_subagent_worktree.py -k isolation -v`）
+- [ ] **Worktree AC16**：子 Agent 写入只出现在 Worktree，主目录对应文件不变。（验证：运行 `pytest tests/integration/test_subagent_worktree.py -k isolation -v`）
+- [ ] **Worktree AC23**：后台 Worktree Job 立即返回 job_id，JobGet 可见 preparing→running→completed，主 Agent 可继续输入。（验证：运行 `pytest tests/integration/test_subagent_worktree.py -k background -v`）
+- [ ] **Worktree AC24**：preparing/running 时 JobStop 进入 cancelled；干净资源回收，修改资源保留且通知含 path/branch/base_commit。（验证：运行 `pytest tests/integration/test_subagent_worktree.py -k cancel -v`）
+- [ ] **Worktree AC25**：分支冲突、坏 manifest、git 失败和取消均不删除非本 Job 资源，且只产生一个终态通知。（验证：运行 `pytest tests/integration/test_subagent_worktree.py -k failure_safety -v`）
 
-- [x] `python -m compileall -q src/Arkcode` 通过
-- [x] `ruff check .` 无告警
-- [x] `ruff format --check .` 通过
-- [x] `mypy src/Arkcode` 通过
-- [x] Parser/Loader/Executor/Installer/Tools/Command/Prompt 的 Skills 专项测试全部通过
-- [x] `pytest -q tests/test_agent.py tests/test_tui.py tests/test_tool.py` 集成回归通过
-- [ ] `pytest -q` 全量通过；若存在任务前已记录的无关基线失败，保留未勾选并附对比证据
-- [x] `git diff --check` 通过
-- [x] `rg "SkillD[e]f" src tests` 无旧类型定义或引用
+### Worktree 质量门与 E2E
 
-## 11. 真实 TUI 端到端场景
+- [ ] **Worktree AC21**：项目启动、Worktree 单测和 lint 通过。（验证：运行 `python3 -m Arkcode --version && ruff check src tests && pytest tests/worktrees tests/tools -q`）
+- [ ] **Worktree AC22**：真实 tmux 中触发隔离子 Agent 后主文件未变、Worktree 文件已变，留盘/清理符合变更状态。（验证：按 E2E-W1 场景执行并记录路径与 diff）
 
-> 使用 `mktemp -d /tmp/arkcode-skills-e2e.XXXXXX` 创建隔离 workspace；使用合法测试
-> Provider 配置。按 `AGENT.md` 优先在 tmux 中运行并保存 capture；tmux 或真实 Provider
-> 不可用时，对应条目保持未勾选并记录环境限制。
+## 3. Agent Team 验收
 
-### 场景 A：启动、Catalog 与管理命令
+### Team 模型、生命周期与恢复
 
-- [ ] **A1** 创建项目 inline Skill `test-skill/SKILL.md` 后启动 ArkCode，启动过程无异常
-- [ ] **A2** `/help` 同时显示 `/skill` 与 `/test-skill`，动态命令描述带 `[skill]`
-- [ ] **A3** 输入 `/` 后补全包含动态 Skill；输入 `/test` 后只保留匹配候选
-- [ ] **A4** `/skill list` 显示 test-skill、description、project 来源
-- [ ] **A5** `/skill info test-skill` 显示 mode/context/path/directory 信息
-- [ ] **A6** 上述纯本地操作前后 token 计数不变
+- [ ] **Team AC1**：teams 根目录缺失时自动创建，已有目录可扫描恢复。（验证：运行 `pytest tests/teams/test_manager.py -k bootstrap -v`）
+- [ ] **Team AC2**：`refactor auth` sanitize 为 `refactor-auth`，config 含 backend、独立 lead_agent_id 和空 members。（验证：运行 `pytest tests/teams/test_manager.py -k create -v`）
+- [ ] **Team AC3**：同名第二个 Team 使用 `-2` 后缀且路径一致。（验证：运行 `pytest tests/teams/test_manager.py -k suffix -v`）
+- [ ] **Team AC4**：有活跃 teammate 时非 force delete 被拒绝且目录保留。（验证：运行 `pytest tests/teams/test_manager.py -k active_delete -v`）
+- [ ] **Team AC5**：force delete 按 kill→Worktree/session→config_dir 顺序清理。（验证：运行 `pytest tests/teams/test_manager.py -k force_delete -v`）
 
-### 场景 B：inline、参数与热重载
+### Backend、spawn 与 cwd
 
-- [ ] **B1** Skill 正文含 `Target: $ARGUMENTS`，执行 `/test-skill first` 后 Agent environment
-  出现 `Target: first`
-- [ ] **B2** 主 Agent 只收到一次触发回合，没有重复 user 消息
-- [ ] **B3** 不退出 TUI，修改正文为新版本后再次执行，environment 出现新版本且旧版本消失
-- [ ] **B4** 修改成非法 YAML 后再次执行，日志有 warning，仍使用最后成功版本
+- [ ] **Team AC6**：后端检测严格遵循 TMUX→iTerm2+it2→PATH tmux→in-process。（验证：运行 `pytest tests/teams/test_backends.py -k detect -v`）
+- [ ] **Team AC7**：Team spawn 创建 Worktree；backend.spawn 入口已能从 config 看到最终 member/agent_id，返回后 pane_id 被回写。（验证：运行 `pytest tests/teams/test_spawner.py -k ordering -v`）
+- [ ] **Team AC8**：in-process teammate 二次 team spawn 被明确拒绝。（验证：运行 `pytest tests/teams/test_backends.py -k nested -v`）
+- [ ] **Team AC23**：tmux spawn 后新 pane 存在且 worker 连接指定 Team。（验证：运行 `pytest tests/integration/test_team_tmux.py -k spawn -v`）
+- [ ] **Team AC24**：SendMessage 对 tmux pane 执行 send-keys 并触发收件。（验证：运行 `pytest tests/integration/test_team_tmux.py -k wake -v`）
+- [ ] **Team AC25**：in-process teammate 使用独立 workspace context，主进程 cwd 始终不变且 os.chdir 未调用。（验证：运行 `pytest tests/teams/test_backends.py -k inprocess -v`）
+- [ ] **Team AC25a**：Pane worker 只在创建 task/Agent 前 chdir 一次，多轮续派后次数仍为 1。（验证：运行 `pytest tests/teams/test_worker.py -k chdir -v`）
 
-### 场景 C：LoadSkill 自动激活
+### 共享任务与消息
 
-- [ ] **C1** 用户自然语言请求与 test-skill description 明确匹配时，Agent 调用 LoadSkill
-- [ ] **C2** LoadSkill 调用不出现权限审批
-- [ ] **C3** tool result 只有简短确认，不显示完整 SOP
-- [ ] **C4** 同一 Agent run 的下一 iteration environment 出现完整 SOP
+- [ ] **Team AC9**：Task* 只对 teammate 可见；SendMessage 只对 Lead/teammate 可见；普通 SubAgent 不可见。（验证：运行 `pytest tests/teams/test_coordinator.py tests/teams/test_shared_tasks.py -k visibility -v`）
+- [ ] **Team AC10**：TaskCreate 持久化，TaskUpdate 双向维护 blocked_by/blocks。（验证：运行 `pytest tests/teams/test_shared_tasks.py -k dependency -v`）
+- [ ] **Team AC11**：TaskList pending 结果的 is_ready 正确反映 blocker 状态。（验证：运行 `pytest tests/teams/test_shared_tasks.py -k ready -v`）
+- [ ] **Team AC12**：发给 alice 的消息写入其 agent_id mailbox 且 unread。（验证：运行 `pytest tests/teams/test_mailbox.py -k direct -v`）
+- [ ] **Team AC13**：Lead 广播到所有 members；teammate 广播到其他 members 和 lead_agent_id。（验证：运行 `pytest tests/teams/test_mailbox.py -k broadcast -v`）
+- [ ] **Team AC14**：10 个并发 mailbox write 无丢失、截断或非法 JSON。（验证：运行 `pytest tests/teams/test_mailbox.py -k concurrent -v`）
+- [ ] **Team AC15**：超过 10 秒的 mailbox lock 被清理后写入成功。（验证：运行 `pytest tests/teams/test_mailbox.py -k stale -v`）
+- [ ] **Team AC15a**：两个进程并发 config 更新无丢失；等待超过 5 秒明确失败。（验证：运行 `pytest tests/teams/test_storage.py -k multiprocess -v`）
+- [ ] **Team AC16**：未读消息在 LLM 前以 `<incoming-messages>` 注入，调用后标 read。（验证：运行 `pytest tests/teams/test_worker.py -k incoming -v`）
+- [ ] **Team AC17**：teammate 完成后 config 标 inactive，Lead 收到 `[idle] <member>`。（验证：运行 `pytest tests/integration/test_team_inprocess.py -k idle -v`）
+- [ ] **Team AC18**：向已停止 in-process teammate 发消息会从 session 恢复 Conversation 并重新 Running。（验证：运行 `pytest tests/integration/test_team_inprocess.py -k resume -v`）
 
-### 场景 D：fork 隔离与回流
+### Plan 审批与 Coordinator
 
-- [ ] **D1** 创建 `mode: fork` 的 fork-skill，分别验证 none/recent/full 至少各一次
-- [ ] **D2** fork 运行期间主 Conversation 消息数和 Active Skills 不变化
-- [ ] **D3** fork 完成后 TUI 显示完整结果，主历史只新增一条 `<system-reminder>` 回流消息
-- [ ] **D4** 退出正在运行 fork 的 TUI，进程正常结束且错误日志无 pending task warning
+- [ ] **Team AC19**：plan_mode_required teammate 初始权限为 plan。（验证：运行 `pytest tests/teams/test_worker.py -k plan_initial -v`）
+- [ ] **Team AC19a**：计划完成后 Lead 收到带非空 request_id 的 plan_approval_request，teammate 保持 plan 并等待。（验证：运行 `pytest tests/teams/test_worker.py -k plan_request -v`）
+- [ ] **Team AC20**：匹配的 approve=True 响应使 teammate 下一轮切回 default。（验证：运行 `pytest tests/teams/test_worker.py -k plan_approve -v`）
+- [ ] **Team AC21**：Coordinator 双锁开启后 allowed tools 精确等于 Agent/SendMessage/JobStop/TeamDelete，其他工具均拒绝，状态栏显示标签。（验证：运行 `pytest tests/teams/test_coordinator.py -k enabled -v`）
+- [ ] **Team AC22**：Coordinator 关闭时普通 Lead 的 write/edit 等原工具保持可用。（验证：运行 `pytest tests/teams/test_coordinator.py -k disabled -v`）
+- [ ] **Team AC30**：Coordinator 中 write_file 和 Bash merge 均拒绝；重启普通模式恢复 Team 后 merge 可用。（验证：运行 Coordinator E2E-C1）
 
-### 场景 E：reload、覆盖与 clear
+### 命令、质量门与 E2E
 
-- [ ] **E1** 创建 name=`review` 的 Skill 并 `/skill reload`，`/review` 执行 Skill 版本
-- [ ] **E2** 删除该 Skill 并 reload，内置 `/review` 恢复
-- [ ] **E3** 激活 test-skill 后执行 `/clear`，新会话 environment 不再含 Active Skills
-- [ ] **E4** `/clear` 后 `/skill list` 仍包含 Catalog，旧会话仍可通过 `/resume` 找到
-- [ ] **E5** 添加坏 Skill 后 reload，日志出现单条 warning，test-skill 仍正常可用
+- [ ] **Team AC26**：`/team list/info/delete` 显示和调用行为正确。（验证：运行 `pytest tests/commands/test_builtins.py -k team -v`）
+- [ ] **Team AC27**：项目启动、Ruff、mypy 和完整 pytest 均通过。（验证：运行第 5 节质量门命令）
+- [ ] **Team AC28**：tmux 端到端完成 TeamCreate→spawn alice→写 hello→SendMessage 续写 world→force delete。（验证：运行 E2E-T1 并记录 pane/config/worktree 状态）
+- [ ] **Team AC29**：in-process 端到端完成 TeamCreate→spawn bob→idle→session resume。（验证：运行 `pytest tests/integration/test_team_inprocess.py -v` 并执行 E2E-I1）
 
-### 场景 F：安装与权限
+## 4. 架构与集成检查
 
-- [ ] **F1** 模型调用 InstallSkill 时出现写操作权限审批；Plan Mode 下直接拒绝
-- [ ] **F2** 使用 MockTransport 的集成场景安装成功后，不重启即可在 `/help` 和补全看到新 Skill
-- [ ] **F3** 模拟超限或缺 SKILL.md，TUI 显示错误，用户目录没有半安装文件
+- [ ] 只有现有 Agent loop 执行 ReAct，SubAgent/teammate 未复制第二套循环。（验证：架构依赖测试 + `pytest tests/architecture -q`）
+- [ ] `agents` 不反向导入 `subagents/worktrees/teams`，领域包依赖方向符合 Plan。（验证：运行 `pytest tests/architecture/test_dependencies.py -v`）
+- [ ] 每个 Agent 的 Runtime、Conversation、Registry discovered 状态和 PermissionLedger 相互隔离。（验证：运行对应并发隔离测试）
+- [ ] 基础 system prompt 不可被 Definition 覆盖，所有角色/teammate instructions 只追加。（验证：捕获 provider request 的 system 内容并断言顺序）
+- [ ] 主进程和 in-process 路径没有 os.chdir；Pane worker 只有一次启动调用。（验证：运行 `rg -n 'os\.chdir' src/Arkcode` 并结合 worker 测试审计）
+- [ ] Worktree setup 没有 hooks 配置实现。（验证：运行 `rg -n 'core\.hooksPath|\.husky' src/Arkcode`，期望无命中）
+- [ ] Team config/tasks/mailbox 的完整 read-modify-write 都位于 FileLock 临界区，backend spawn/kill 不持锁。（验证：并发测试 + timeout 测试）
+- [ ] TeamSpawner 在 backend 前预注册，失败回滚不留下 member/name/Worktree/session 残骸。（验证：运行 `pytest tests/teams/test_spawner.py -v`）
+- [ ] Coordinator RegistryView 无法通过 deferred tools、ToolSearch、MCP 或 Skill 绕过白名单。（验证：运行 Coordinator filtering 测试）
+- [ ] Runtime shutdown 后没有存活 asyncio task、pending approval Future 或遗留 Pane。（验证：运行 Application shutdown 测试并检查 task/pane 列表）
 
-### 场景 G：收尾
+## 5. 语法、静态检查与完整测试
 
-- [ ] **G1** `/exit` 正常结束 ArkCode/tmux 会话
-- [ ] **G2** capture 与测试输出整理到本次验收报告，每个场景至少一份可复核证据
-- [ ] **G3** 删除隔离 workspace；不删除或修改用户原有 Skill、会话及测试外文件
+- [ ] Python 模块全部可编译。（验证：`python3 -m compileall src/Arkcode`，退出码 0）
+- [ ] Ruff 无错误。（验证：`ruff check src tests`，退出码 0）
+- [ ] mypy strict 无错误。（验证：`mypy src/Arkcode`，退出码 0）
+- [ ] 全部测试通过。（验证：`pytest -q`，记录 passed/failed/skipped 总数；failed 必须为 0）
+- [ ] tmux/iTerm2 缺失时只有显式条件集成测试 skip，不得把功能失败误报为 skip。（验证：查看 pytest skip reason）
 
-## 12. 文档一致性
+## 6. 端到端场景
 
-- [x] spec.md 的每条 F/N 需求至少对应上面一个验收项
-- [x] plan.md、task.md、checklist.md 全部使用 `SkillMeta/SkillLoader/SkillExecutor`
-- [x] 四份文档中的源码路径全部指向当前 `src/Arkcode/` 结构
-- [ ] task.md 的 T1-T13 均有真实验证证据并勾选
-- [x] checklist 所有未通过项都有实际结果、原因和后续动作，不用推断标记通过
+### E2E-S1：SubAgent 前台、后台与续派
 
-## 完成准则
+- [ ] 启动 Arkcode，调用 explore 前台任务，观察最终文本返回；再启动后台任务，观察立即返回 job_id、JobList/JobGet 可查、完成后出现 `<task-notification>`；最后 JobSend 续派并得到新 job_id。（证据：终端日志与两个 job_id）
 
-- 上述所有非可选 checkbox 均已获得运行或观察证据。
-- 全量质量门禁无本功能引入的失败。
-- 真实 TUI 的核心链路至少覆盖：加载 → Catalog → 显式 inline → LoadSkill → fork →
-  reload → clear。
-- 工作区没有测试 staging、临时 Skill 或冲突检测残留。
+### E2E-W1：隔离 Worktree
 
-## 验收证据（2026-08-08）
+- [ ] 在临时 Git 仓库让 `isolation:worktree` 子 Agent 修改 `server.py`；确认主目录文件未变、Worktree 文件已变，Job 通知包含保留或清理结果。（证据：主目录/Worktree `git diff` 对比）
 
-- Skills 相关定向回归：182 passed；包含权限、隔离、认证、回滚与热注册证据。
-- 质量门：compileall、ruff check、ruff format --check、mypy、git diff --check 均通过。
-- 全量 pytest：384 passed、1 failed；失败为任务开始前已记录的
-  `tests/test_mcp_config.py::test_documented_example_is_a_valid_three_server_config`，
-  原因是仓库缺少 `docs/mcp/mcp-servers.example.yaml`，与 Skills 改动无关。后续动作：
-  补回该 MCP 示例文件后重跑全量测试。
-- 真实 TUI：当前环境未安装 tmux，且没有可用于真实模型调用的测试 Provider 凭据。
-  按 T13.8，场景 A-G 保持未勾选；后续动作是在具备 tmux 与隔离测试凭据的环境中按
-  T13.1-T13.7 执行并保存 capture。
-- 自动化测试使用 pytest `tmp_path` 隔离项目/用户 Skill 与 session；未创建或删除用户
-  原有 Skill，也未在仓库留下安装 staging。
-- Spec 映射：F1-F5 → §1-2；F6-F7 → §5；F10-F11 → §3-4；
-  F12-F14 → §6；F17-F18 → §2/§7；F19 → §8-9；F20 → §2；
-  N1/N5 → §2；N2 → §4；N3 → §5。
+### E2E-I1：in-process Team
+
+- [ ] 强制无 tmux/iTerm2 环境，创建 Team 和 bob；确认主 cwd 不变、bob 在独立 Worktree 完成任务、Lead 收到 idle、SendMessage 后从原 Conversation 续派。（证据：config.json、mailbox、session journal）
+
+### E2E-T1：tmux Team
+
+- [ ] 在 tmux 内创建 Team 和 alice；确认新 pane、初始任务执行、消息 wake、再次执行及 force delete 全链路。（证据：pane 列表、worktree、team 目录和输出文件）
+
+### E2E-C1：Coordinator 与收敛
+
+- [ ] 双锁开启 Coordinator，确认只剩四个工具且 Bash merge 被拒绝；保留 Team/Worktree 后退出，普通模式重启恢复 Team，执行 merge，最后 TeamDelete。（证据：拒绝结果、重启前后工具列表、merge log、清理结果）
+
+## 7. 最终验收报告要求
+
+- [ ] 报告按“通过 / 未通过 / 跳过 / 端到端”分类，每项引用本 Checklist 编号和实际证据。（验证：检查最终报告的四个固定小节和证据链接）
+- [ ] 任一失败项必须记录预期、实际、复现命令和修复后复验结果。（验证：抽查所有失败条目字段完整）
+- [ ] 未运行的项目不得标记通过；环境不具备只能标记跳过并说明原因。（验证：对照命令执行日志与报告状态）
