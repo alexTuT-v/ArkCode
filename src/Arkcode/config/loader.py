@@ -7,7 +7,13 @@ from typing import cast
 
 from dotenv import load_dotenv
 
-from .models import Config, ConfigError, ProtocolName, ProviderConfig
+from .models import (
+    Config,
+    ConfigError,
+    Features,
+    ProtocolName,
+    ProviderConfig,
+)
 
 _PROTOCOLS = {"anthropic", "openai"}
 _PROVIDER_NAME = re.compile(r"^[A-Za-z0-9_]+$")
@@ -75,7 +81,24 @@ def _from_environment() -> Config:
             )
         )
 
-    return Config(providers=providers)
+    def _truthy(value: str | None, default: bool = False) -> bool:
+        if value is None or not value.strip():
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    background = _truthy(
+        os.environ.get("ARKCODE_ENABLE_SUBAGENT_BACKGROUND"),
+        True,
+    )
+    coordinator_feature = _truthy(
+        os.environ.get("ARKCODE_FEATURE_COORDINATOR_MODE"),
+        False,
+    )
+    return Config(
+        providers=providers,
+        features=Features(coordinator_mode=coordinator_feature),
+        enable_subagent_background=background,
+    )
 
 
 def effective_context_window(provider: ProviderConfig) -> int:

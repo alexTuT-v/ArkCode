@@ -22,6 +22,7 @@ from Arkcode.agents import (
     Mode,
     Phase,
 )
+from Arkcode.agents.events import RunStatus
 from Arkcode.agents.runtime import SessionRuntime
 from Arkcode.context import (
     CompactCircuitBreaker,
@@ -243,6 +244,53 @@ async def collect(
             cancel or asyncio.Event(),
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_run_to_completion_appends_task_and_returns_result(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider(
+        [
+            [TextDelta("探索完成"), end()],
+        ]
+    )
+    session_runtime = runtime(tmp_path)
+    conversation = Conversation()
+    conversation.add_user("原有问题")
+    agent = Agent(
+        provider,
+        Registry(),
+        "test",
+        None,
+        runtime=session_runtime,
+        instructions_content="你是只读探索者",
+    )
+    result = await agent.run_to_completion(conversation, "去读 README")
+    assert result.status is RunStatus.COMPLETED
+    assert result.final_text == "探索完成"
+    assert conversation.messages()[-1].role == "assistant"
+    assert provider.requests[0].system.stable.endswith("你是只读探索者")
+
+
+@pytest.mark.asyncio
+async def test_run_to_completion_max_turns_returns_limit_reached(
+    tmp_path: Path,
+) -> None:
+    provider = RepeatingToolProvider("read_file")
+    session_runtime = runtime(tmp_path)
+    conversation = Conversation()
+    agent = Agent(
+        provider,
+        registry_with(InstrumentedTool("read_file", _read_only=True)),
+        "test",
+        None,
+        runtime=session_runtime,
+        max_turns=2,
+    )
+    result = await agent.run_to_completion(conversation, "循环任务")
+    assert result.status is RunStatus.LIMIT_REACHED
+    assert result.error is None
 
 
 class MemorySpy:

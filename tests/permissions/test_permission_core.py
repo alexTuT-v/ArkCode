@@ -11,6 +11,10 @@ from Arkcode.permissions.blacklist import hits_blacklist
 from Arkcode.permissions.engine import mode_fallback
 from Arkcode.permissions.rules import Rule, RuleSet, match_pattern, parse_rule
 from Arkcode.permissions.sandbox import sandbox_ok
+from Arkcode.permissions.scope import (
+    PermissionLedger,
+    PermissionScope,
+)
 from Arkcode.permissions.settings import (
     SettingsError,
     extract_target,
@@ -95,8 +99,85 @@ def test_mode_matrix_and_safe_defaults(tmp_path: Path) -> None:
     assert mode_fallback(Mode.ACCEPT_EDITS, Category.EXEC) is Decision.ASK
     assert mode_fallback(Mode.PLAN, Category.WRITE) is Decision.ASK
     assert mode_fallback(Mode.BYPASS, Category.EXEC) is Decision.ALLOW
+    assert mode_fallback(Mode.DONT_ASK, Category.WRITE) is Decision.ALLOW
+    assert mode_fallback(Mode.DONT_ASK, Category.EXEC) is Decision.ALLOW
     engine, _ = new_engine(str(tmp_path))
     assert engine.check(Mode.DEFAULT, call("unknown", {}), False)[0] is Decision.ASK
+
+
+def test_scope_rules_match_only_current_scope(tmp_path: Path) -> None:
+    project = tmp_path / ".Arkcode"
+    project.mkdir()
+    settings = project / "settings.yaml"
+    settings.write_text(
+        (
+            "permissions:\n"
+            "  allow:\n"
+            "    - tool: Bash\n"
+            "      pattern: git status\n"
+            "      scope: subagent-type:explore\n"
+        ),
+        encoding="utf-8",
+    )
+    engine, _ = new_engine(str(tmp_path))
+    main_call = call("bash", {"command": "git status"})
+    main_decision, _ = engine.check(Mode.DEFAULT, main_call, False)
+    assert main_decision is Decision.ASK
+
+    child = engine.child(
+        PermissionScope.subagent_type("explore"),
+        PermissionLedger(),
+        Mode.DEFAULT,
+    )
+    child_decision, _ = child.check(Mode.DEFAULT, main_call, False)
+    assert child_decision is Decision.ALLOW
+
+    other = engine.child(
+        PermissionScope.subagent_type("worker"),
+        PermissionLedger(),
+        Mode.DEFAULT,
+    )
+    other_decision, _ = other.check(Mode.DEFAULT, main_call, False)
+    assert other_decision is Decision.ASK
+
+
+def test_system_deny_is_not_bypassed_by_dont_ask(tmp_path: Path) -> None:
+    engine, _ = new_engine(str(tmp_path))
+    decision, _ = engine.check(
+        Mode.DONT_ASK,
+        call("bash", {"command": "rm -rf /"}),
+        False,
+    )
+    assert decision is Decision.DENY
+
+
+def test_ledger_is_isolated_between_agents(tmp_path: Path) -> None:
+    engine, _ = new_engine(str(tmp_path))
+    ledger_a = PermissionLedger()
+    ledger_a.record_allow(call("bash", {"command": "git status"}))
+    child_a = engine.child(
+        PermissionScope.subagent_instance("agent-a"),
+        ledger_a,
+        Mode.DEFAULT,
+    )
+    child_b = engine.child(
+        PermissionScope.subagent_instance("agent-b"),
+        PermissionLedger(),
+        Mode.DEFAULT,
+    )
+    git_call = call("bash", {"command": "git status"})
+    assert child_a.check(Mode.DEFAULT, git_call, False)[0] is Decision.ALLOW
+    assert child_b.check(Mode.DEFAULT, git_call, False)[0] is Decision.ASK
+
+
+def test_dont_ask_auto_allows_ask_class_operations(tmp_path: Path) -> None:
+    engine, _ = new_engine(str(tmp_path))
+    decision, _ = engine.check(
+        Mode.DONT_ASK,
+        call("bash", {"command": "ls -la"}),
+        False,
+    )
+    assert decision is Decision.ALLOW
     assert (
         engine.check(Mode.DEFAULT, call("write_file", "{"), False)[0] is Decision.DENY
     )

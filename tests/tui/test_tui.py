@@ -876,6 +876,44 @@ async def test_escape_denies_pending_approval_without_exiting(
 
 
 @pytest.mark.asyncio
+async def test_escape_moves_foreground_subagent_to_background(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Arkcode.conversations import Conversation
+    from Arkcode.subagents.manager import TaskManager
+    from Arkcode.subagents.models import BackgroundTask
+    from tests.subagents.test_manager import StubAgent
+
+    provider = ControlledProvider([])
+    monkeypatch.setattr(session_module, "new_provider", lambda config: provider)
+    app = make_app([provider_config()])
+    manager = TaskManager()
+    job = BackgroundTask(
+        id="job-esc",
+        agent_id="agent-1",
+        name="foreground",
+        agent_type="explore",
+        agent=StubAgent(delay=1.0),  # type: ignore[arg-type]
+        conversation=Conversation(),
+        task_text="任务",
+        run_in_background=False,
+    )
+    manager.launch(job)
+    job.foreground = True
+    app.session.task_manager = manager  # type: ignore[attr-defined]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.state = SessionState.STREAMING
+        app.action_cancel_turn()
+        await pilot.pause()
+
+        assert job.run_in_background is True
+        assert app.state is SessionState.STREAMING
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("key", "outcome"),
     [("1", Outcome.ALLOW_ONCE), ("3", Outcome.DENY_ONCE)],

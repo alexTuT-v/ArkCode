@@ -7,21 +7,21 @@ import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from ..llm import ToolCall, ToolResult
 from ..permissions import Decision, Engine, Mode, Outcome
+from ..permissions.scope import PermissionLedger, PermissionScope
 from ..tools import DEFAULT_TIMEOUT, Registry
 from .events import NOTICE_CANCELLED, AgentEvent, ApprovalRequest, Phase, ToolEvent
+from .identity import AgentIdentity, identity_scope
 from .runtime import SessionRuntime
 
 
-@dataclass
-class BatchState:
-    """一次工具批执行累积出的状态。"""
+class ApprovalBroker(Protocol):
+    """SubAgent 审批转发契约：submit 挂起直到外部响应。"""
 
-    results: list[ToolResult | None]
-    completed: bool = True
+    async def submit(self, request: ApprovalRequest) -> Outcome: ...
 
 
 def _args_preview(call: ToolCall) -> str:
@@ -37,6 +37,14 @@ def cancelled_result(call: ToolCall) -> ToolResult:
     )
 
 
+@dataclass
+class BatchState:
+    """一次工具批执行累积出的状态。"""
+
+    results: list[ToolResult | None]
+    completed: bool = True
+
+
 class ToolExecutor:
     """按权限策略并发或串行执行一批工具调用。"""
 
@@ -46,11 +54,20 @@ class ToolExecutor:
         engine: Engine | None,
         permissions_enabled: bool,
         runtime: SessionRuntime,
+        *,
+        broker: ApprovalBroker | None = None,
+        identity: AgentIdentity | None = None,
+        scope: PermissionScope | None = None,
+        ledger: PermissionLedger | None = None,
     ) -> None:
         self._registry = registry
         self._engine = engine
         self._permissions_enabled = permissions_enabled
         self._runtime = runtime
+        self._broker = broker
+        self._identity = identity
+        self._scope = scope
+        self._ledger = ledger
 
     def _check_permission(
         self,
@@ -64,6 +81,103 @@ class ToolExecutor:
             return Decision.ALLOW, ""
         assert self._engine is not None
         return self._engine.check(mode, call, read_only)
+
+    def _approval_outcome(
+        self,
+        outcome: Outcome,
+        call: ToolCall,
+    ) -> tuple[Decision, str]:
+        """把审批结果映射为最终决策，并写入对应的账本或持久规则。"""
+
+        if outcome is Outcome.DENY_ONCE:
+            if self._ledger is not None:
+                self._ledger.record_deny(call)
+            return Decision.DENY, "用户拒绝本次工具调用"
+        if outcome is Outcome.ALLOW_ONCE:
+            return Decision.ALLOW, "用户已放行本次调用"
+        if outcome is Outcome.ALLOW_AGENT:
+            if self._ledger is not None:
+                self._ledger.record_allow(call)
+            return Decision.ALLOW, "已为本次 SubAgent 会话放行"
+        if outcome is Outcome.SAVE_PROJECT_RULE:
+            if self._engine is not None:
+                try:
+                    self._engine.persist_scoped_allow(call, self._scope)
+                except Exception:
+                    # 持久化失败不能改变用户已作出的本次放行决定。
+                    pass
+            return Decision.ALLOW, "已保存为项目级作用域规则"
+        if outcome is Outcome.ALLOW_FOREVER:
+            if self._engine is not None:
+                try:
+                    self._engine.persist_local_allow(call)
+                except Exception:
+                    pass
+            return Decision.ALLOW, "已永久放行"
+        return Decision.DENY, "未识别的审批结果"
+
+    async def _await_approval(
+        self,
+        call: ToolCall,
+        reason: str,
+        cancel: asyncio.Event,
+        state: BatchState,
+        index: int,
+    ) -> AsyncIterator[AgentEvent | Decision | None]:
+        """主 Agent 走 TUI 事件；SubAgent 走 ApprovalBroker。"""
+
+        if self._broker is not None:
+            assert self._identity is not None
+            respond: asyncio.Future[Outcome] = (
+                asyncio.get_running_loop().create_future()
+            )
+            request = ApprovalRequest(
+                name=call.name,
+                args=_args_preview(call),
+                reason=reason,
+                respond=respond,
+                agent_id=self._identity.agent_id,
+                agent_name=self._identity.name,
+                agent_type=self._identity.agent_type,
+            )
+            outcome = await self._broker.submit(request)
+            decision, _ = self._approval_outcome(outcome, call)
+            yield decision
+            return
+
+        respond = asyncio.get_running_loop().create_future()
+        yield_request = ApprovalRequest(
+            call.name,
+            _args_preview(call),
+            reason,
+            respond,
+        )
+        yield AgentEvent(approval=yield_request)
+        cancelled = asyncio.create_task(cancel.wait())
+        try:
+            approval_waiters: set[asyncio.Future[Any]] = {
+                respond,
+                cancelled,
+            }
+            approval_done, _ = await asyncio.wait(
+                approval_waiters,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancelled in approval_done and cancel.is_set():
+                state.completed = False
+                state.results[index] = cancelled_result(call)
+                if not respond.done():
+                    respond.cancel()
+                yield None
+                return
+            outcome = respond.result()
+        finally:
+            cancelled.cancel()
+            await asyncio.gather(cancelled, return_exceptions=True)
+            if not respond.done():
+                respond.cancel()
+        decision, _ = self._approval_outcome(outcome, call)
+        yield decision if decision is not None else Decision.DENY
 
     async def execute(
         self,
@@ -129,11 +243,19 @@ class ToolExecutor:
 
         async def execute_one(index: int) -> None:
             call = calls[index]
-            result = await self._registry.execute(
-                call.name,
-                call.input,
-                timeout=DEFAULT_TIMEOUT,
-            )
+            if self._identity is not None:
+                with identity_scope(self._identity):
+                    result = await self._registry.execute(
+                        call.name,
+                        call.input,
+                        timeout=DEFAULT_TIMEOUT,
+                    )
+            else:
+                result = await self._registry.execute(
+                    call.name,
+                    call.input,
+                    timeout=DEFAULT_TIMEOUT,
+                )
             if call.name == "read_file" and not result.is_error:
                 try:
                     arguments = json.loads(call.input or "{}")
@@ -171,52 +293,21 @@ class ToolExecutor:
             call = calls[index]
             decision, reason = self._check_permission(mode, call, False)
             if decision is Decision.ASK:
-                respond: asyncio.Future[Outcome] = (
-                    asyncio.get_running_loop().create_future()
-                )
-                yield AgentEvent(
-                    approval=ApprovalRequest(
-                        call.name,
-                        _args_preview(call),
-                        reason,
-                        respond,
-                    )
-                )
-                cancelled = asyncio.create_task(cancel.wait())
-                try:
-                    approval_waiters: set[asyncio.Future[Any]] = {
-                        respond,
-                        cancelled,
-                    }
-                    approval_done, _ = await asyncio.wait(
-                        approval_waiters,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if cancelled in approval_done and cancel.is_set():
-                        state.completed = False
-                        state.results[index] = cancelled_result(call)
-                        if not respond.done():
-                            respond.cancel()
-                        return
-                    outcome = respond.result()
-                finally:
-                    cancelled.cancel()
-                    await asyncio.gather(cancelled, return_exceptions=True)
-                    if not respond.done():
-                        respond.cancel()
-
-                if outcome is Outcome.DENY_ONCE:
-                    decision = Decision.DENY
-                    reason = "用户拒绝本次工具调用"
-                else:
-                    if outcome is Outcome.ALLOW_FOREVER:
-                        assert self._engine is not None
-                        try:
-                            self._engine.persist_local_allow(call)
-                        except Exception:
-                            # 持久化失败不能改变用户已作出的本次放行决定。
-                            pass
-                    decision = Decision.ALLOW
+                decided: Decision | None = None
+                async for yielded in self._await_approval(
+                    call,
+                    reason,
+                    cancel,
+                    state,
+                    index,
+                ):
+                    if isinstance(yielded, AgentEvent):
+                        yield yielded
+                    else:
+                        decided = yielded
+                if decided is None:
+                    return
+                decision = decided
             if decision is Decision.DENY:
                 state.results[index] = ToolResult(
                     tool_call_id=call.id,

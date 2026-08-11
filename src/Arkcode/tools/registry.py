@@ -18,6 +18,18 @@ class Registry:
         self._order: list[str] = []
         self._tools: dict[str, Tool[Any]] = {}
         self._discovered: set[str] = set()
+        self._timeouts: dict[str, float | None] = {}
+
+    def set_timeout(self, name: str, timeout: float | None) -> None:
+        """为单个工具覆盖默认执行超时；None 表示不限时。"""
+
+        self._timeouts[name] = timeout
+
+    def disable_timeout(self, name: str) -> None:
+        self._timeouts[name] = None
+
+    def timeout_for(self, name: str) -> float | None:
+        return self._timeouts.get(name)
 
     def mark_discovered(self, name: str) -> None:
         self._discovered.add(name)
@@ -143,7 +155,18 @@ class Registry:
         except ValidationError as exc:
             return Result(content=f"参数校验失败: {exc}", is_error=True)
         try:
-            return await asyncio.wait_for(tool.execute(params), timeout=timeout)
+            timeout_override = self._timeouts.get(name)
+            effective_timeout = (
+                timeout_override
+                if timeout_override is not None
+                else timeout
+            )
+            if effective_timeout is None:
+                return await tool.execute(params)
+            return await asyncio.wait_for(
+                tool.execute(params),
+                timeout=effective_timeout,
+            )
         except TimeoutError:
             return Result(content=f"工具 {name} 执行超时（{timeout}s）", is_error=True)
         except asyncio.CancelledError:

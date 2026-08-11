@@ -61,3 +61,39 @@ def persist_local_allow(engine: "Engine", call: ToolCall) -> None:
     )
     if rule not in engine.local.allow:
         engine.local.allow.append(rule)
+
+
+def persist_scoped_allow(
+    engine: "Engine",
+    call: ToolCall,
+    scope: object | None,
+) -> None:
+    """把带作用域的对象规则写入项目级 settings.yaml。"""
+
+    rule, _, ok = rule_for(engine, call)
+    if not ok:
+        raise ValueError("无法为工具调用生成作用域规则")
+    scope_value = getattr(scope, "value", "global") if scope is not None else "global"
+    project_path = Path(engine.root) / ".Arkcode" / "settings.yaml"
+    project_path.parent.mkdir(parents=True, exist_ok=True)
+    settings = load_settings(str(project_path))
+    object_rule = {
+        "tool": rule.tool,
+        "pattern": rule.pattern or "",
+        "scope": scope_value,
+        "decision": "allow",
+    }
+    if object_rule not in settings.permissions.allow:
+        settings.permissions.allow.append(object_rule)
+    data = {
+        "default_mode": settings.default_mode or "default",
+        "permissions": {
+            "allow": settings.permissions.allow,
+            "ask": settings.permissions.ask,
+            "deny": settings.permissions.deny,
+        },
+    }
+    project_path.write_text(
+        yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )

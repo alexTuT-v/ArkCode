@@ -11,6 +11,7 @@ from Arkcode.config import ProviderConfig
 from Arkcode.conversations import Conversation
 from Arkcode.llm import Message, Request, StreamEnd, TextDelta, ToolResult
 from Arkcode.skills import SkillExecutor, SkillMeta
+from Arkcode.subagents.models import LaunchOutcome, LaunchRequest
 from Arkcode.tools import Registry, Result
 from Arkcode.tools.base import Tool
 
@@ -143,6 +144,56 @@ def make_executor(
         tmp_path,
     )
     return executor, main_agent, configs
+
+
+class RecordingLauncher:
+    def __init__(self) -> None:
+        self.calls: list[tuple[LaunchRequest, str]] = []
+
+    async def launch_fork(
+        self,
+        request: LaunchRequest,
+        parent: object,
+        *,
+        base_messages: list[object] | None = None,
+        run_in_background: bool = False,
+    ) -> LaunchOutcome:
+        self.calls.append((request, request.prompt))
+        return LaunchOutcome(
+            job_id="job-skill",
+            status="completed",
+            final_text="skill 结果",
+        )
+
+
+@pytest.mark.asyncio
+async def test_fork_uses_unified_launcher_when_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+
+    launcher = RecordingLauncher()
+    registry = Registry()
+    executor = SkillExecutor(
+        RecordingMainAgent(),  # type: ignore[arg-type]
+        Conversation(),
+        ProviderConfig(
+            name="fake", protocol="openai", api_key="secret", model="main-model"
+        ),
+        registry,
+        None,
+        "1.2.3",
+        tmp_path,
+        launcher=launcher,  # type: ignore[arg-type]
+    )
+
+    result = await executor.execute_fork(skill(), "src")
+
+    assert result == "skill 结果"
+    assert len(launcher.calls) == 1
+    request, _ = launcher.calls[0]
+    assert request.subagent_type is None
+    assert request.prompt == "Review src"
 
 
 @pytest.mark.parametrize(

@@ -14,6 +14,17 @@ from ..memory import Manager as MemoryManager
 from ..permissions import new_engine
 from ..sessions import clean_expired
 from ..skills import SkillLoader
+from ..subagents.approvals import ApprovalBroker
+from ..subagents.catalog import Catalog
+from ..subagents.launcher import SubAgentLauncher
+from ..subagents.manager import TaskManager
+from ..subagents.tools import (
+    AgentTool,
+    JobGetTool,
+    JobListTool,
+    JobSendTool,
+    JobStopTool,
+)
 from ..tools import new_default_registry
 from .runtime import ApplicationRuntime
 from .session import SessionService
@@ -43,6 +54,27 @@ async def build_runtime(workspace: Path, version: str) -> ApplicationRuntime:
         engine, error = new_engine(str(root))
         if error is not None:
             print(f"权限引擎降级: {error}", file=sys.stderr)
+        catalog = Catalog(root, Path.home())
+        catalog.load()
+        task_manager = TaskManager()
+        approval_broker = ApprovalBroker()
+        launcher = SubAgentLauncher(
+            catalog=catalog,
+            task_manager=task_manager,
+            broker=approval_broker,
+            engine=engine,
+            version=version,
+            workspace=root,
+            providers=list(config.providers),
+            parent_config=config.providers[0] if config.providers else None,
+            enable_background=config.enable_subagent_background,
+        )
+        registry.register(AgentTool(launcher))
+        registry.register(JobListTool(task_manager))
+        registry.register(JobGetTool(task_manager))
+        registry.register(JobStopTool(task_manager))
+        registry.register(JobSendTool(task_manager))
+        registry.disable_timeout("Agent")
         skills = SkillLoader(root)
         skills.load_all()
         session = SessionService(
@@ -56,6 +88,12 @@ async def build_runtime(workspace: Path, version: str) -> ApplicationRuntime:
             memory_text=memory_text,
             sessions_dir=sessions_dir,
             mcp_instructions=mcp_manager.instructions_text(),
+            config=config,
+            provider_configs=list(config.providers),
+            task_manager=task_manager,
+            catalog=catalog,
+            approval_broker=approval_broker,
+            launcher=launcher,
         )
         cleanup_task = asyncio.create_task(
             asyncio.to_thread(clean_expired, sessions_dir, timedelta(days=30))
@@ -72,6 +110,10 @@ async def build_runtime(workspace: Path, version: str) -> ApplicationRuntime:
             skills=skills,
             session=session,
             cleanup_task=cleanup_task,
+            catalog=catalog,
+            task_manager=task_manager,
+            approval_broker=approval_broker,
+            launcher=launcher,
         )
     except Exception:
         await mcp_manager.close()

@@ -98,4 +98,14 @@ class SessionState(Enum):
 def next_mode(mode: Mode) -> Mode:
     """按 UI 展示顺序循环到下一档权限模式。"""
 
-    return Mode((int(mode) + 1) % len(Mode))
+    cycle = (
+        Mode.DEFAULT,
+        Mode.ACCEPT_EDITS,
+        Mode.PLAN,
+        Mode.BYPASS,
+    )
+    try:
+        index = cycle.index(mode)
+    except ValueError:
+        return Mode.DEFAULT
+    return cycle[(index + 1) % len(cycle)]

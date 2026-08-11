@@ -8,7 +8,7 @@ import yaml  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..llm import ToolCall
-from .rules import RuleSet, parse_rule
+from .rules import Rule, RuleSet, parse_rule
 from .types import Category
 
 
@@ -19,18 +19,22 @@ class SettingsError(ValueError):
 class PermissionsBlock(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    allow: list[str] = Field(default_factory=list)
-    ask: list[str] = Field(default_factory=list)
-    deny: list[str] = Field(default_factory=list)
+    allow: list[str | dict[str, Any]] = Field(default_factory=list)
+    ask: list[str | dict[str, Any]] = Field(default_factory=list)
+    deny: list[str | dict[str, Any]] = Field(default_factory=list)
 
     @field_validator("allow", "ask", "deny", mode="before")
     @classmethod
-    def _ignore_non_strings(cls, value: object) -> object:
-        """保留现有宽容语义：列表中的非字符串项被忽略。"""
+    def _normalize_items(cls, value: object) -> object:
+        """保留字符串规则；字典形式作为带作用域的对象规则。"""
 
         if not isinstance(value, list):
             return []
-        return [item for item in value if isinstance(item, str)]
+        return [
+            item
+            for item in value
+            if isinstance(item, str) or isinstance(item, dict)
+        ]
 
 
 class Settings(BaseModel):
@@ -63,10 +67,34 @@ def to_rule_set(settings: Settings) -> RuleSet:
         *[(value, True, result.ask) for value in settings.permissions.ask],
         *[(value, False, result.deny) for value in settings.permissions.deny],
     ):
-        rule, ok = parse_rule(value, allow)
+        rule, ok = _parse_setting_item(value, allow)
         if ok:
             destination.append(rule)
     return result
+
+
+def _parse_setting_item(
+    value: str | dict[str, Any],
+    allow: bool,
+) -> tuple[Rule, bool]:
+    """解析字符串或对象形式的规则条目。"""
+
+    if isinstance(value, str):
+        return parse_rule(value, allow)
+    tool = value.get("tool")
+    pattern = value.get("pattern", "")
+    scope = value.get("scope", "global")
+    if not isinstance(tool, str) or not tool:
+        rule, _ = parse_rule("", allow)
+        return rule, False
+    if not isinstance(pattern, str):
+        pattern = ""
+    if not isinstance(scope, str):
+        scope = "global"
+    rule, ok = parse_rule(tool, allow, scope)
+    if not ok:
+        return rule, False
+    return Rule(tool, pattern, allow, scope), True
 
 
 def friendly_name(name: str) -> str:

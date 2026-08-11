@@ -36,6 +36,7 @@ from .controllers.skills import SkillsController
 from .state import AppStateMixin, SessionState, next_mode
 from .streaming import StreamingController
 from .streaming.host import StreamingHostApp
+from .tasks import consume_job_notifications, consume_subagent_approvals
 from .views.banner import render_banner
 from .views.status import mcp_status_line
 from .widgets.completion import CompletionMenu
@@ -144,6 +145,7 @@ class ArkCodeApp(AppStateMixin, App[None]):
         self.usage_out = 0
         self.usage_cache_read = 0
         self.usage_cache_creation = 0
+        self._consumer_tasks: list[asyncio.Task[None]] = []
 
     def compose(self) -> ComposeResult:
         if len(self.providers) > 1:
@@ -168,6 +170,7 @@ class ArkCodeApp(AppStateMixin, App[None]):
         self.resume_list = self.query_one("#resume-list", OptionList)
         self.resume_list.display = False
         self.write_log(render_banner(self._version, str(self.workspace)))
+        self._start_background_consumers()
         if self.mcp_status is not None:
             summary = mcp_status_line(self.mcp_status)
             if summary is not None:
@@ -177,7 +180,26 @@ class ArkCodeApp(AppStateMixin, App[None]):
             return
         self.provider_controller.show_selection()
 
+    def _start_background_consumers(self) -> None:
+        manager = getattr(self.session, "task_manager", None)
+        if manager is not None:
+            self._consumer_tasks.append(
+                asyncio.create_task(
+                    consume_job_notifications(manager, self.session)
+                )
+            )
+        broker = getattr(self.session, "approval_broker", None)
+        if broker is not None:
+            self._consumer_tasks.append(
+                asyncio.create_task(consume_subagent_approvals(broker, self))
+            )
+
     async def on_unmount(self) -> None:
+        for task in self._consumer_tasks:
+            task.cancel()
+        if self._consumer_tasks:
+            await asyncio.gather(*self._consumer_tasks, return_exceptions=True)
+            self._consumer_tasks.clear()
         await self.session.shutdown()
 
     async def on_option_list_option_selected(
@@ -273,6 +295,20 @@ class ArkCodeApp(AppStateMixin, App[None]):
             self.sessions.cancel_resume()
             return
         if self.state in (SessionState.STREAMING, SessionState.APPROVING):
+            manager = self.session.task_manager
+            moved = (
+                manager.move_foreground_to_background()
+                if manager is not None
+                else None
+            )
+            if moved is not None:
+                self.write_log(
+                    Text(
+                        f"前台子 Agent Job {moved} 已切到后台，主对话可继续输入",
+                        style="dim",
+                    )
+                )
+                return
             self._cancel_active_turn()
 
     def _cancel_active_turn(self) -> None:

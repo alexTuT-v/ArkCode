@@ -32,6 +32,7 @@ from ..llm import (
 )
 from ..memory import Manager, MemoryTurn
 from ..permissions import Engine, Mode
+from ..permissions.scope import PermissionLedger, PermissionScope
 from ..prompts import (
     build_system_prompt,
     combine_reminders,
@@ -52,9 +53,18 @@ from .events import (
     AgentEvent,
     CompactEvent,
     CompactPhase,
+    Phase,
+    RunResult,
+    RunStatus,
     Usage,
 )
-from .execution import BatchState, ToolExecutor, cancelled_result
+from .execution import (
+    ApprovalBroker,
+    BatchState,
+    ToolExecutor,
+    cancelled_result,
+)
+from .identity import AgentIdentity
 from .runtime import SessionRuntime
 from .streaming import StreamState, stream_once
 
@@ -82,6 +92,12 @@ class Agent:
         memory_manager: Manager | None = None,
         instruction_text: str = "",
         memory_text: str = "",
+        instructions_content: str = "",
+        max_turns: int = MAX_ITERATIONS,
+        identity: AgentIdentity | None = None,
+        permission_scope: PermissionScope | None = None,
+        permission_ledger: PermissionLedger | None = None,
+        approval_broker: ApprovalBroker | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -96,6 +112,12 @@ class Agent:
         self._memory_manager = memory_manager
         self._instruction_text = instruction_text
         self._memory_text = memory_text
+        self._instructions_content = instructions_content
+        self._max_turns = max_turns
+        self._identity = identity
+        self._permission_scope = permission_scope
+        self._permission_ledger = permission_ledger
+        self._limit_reached = False
         self.active_skills: dict[str, str] = {}
         self._skill_catalog = ""
         self._run_lock = asyncio.Lock()
@@ -104,6 +126,10 @@ class Agent:
             self._engine,
             self._permissions_enabled,
             self.runtime,
+            broker=approval_broker,
+            identity=identity,
+            scope=permission_scope,
+            ledger=permission_ledger,
         )
 
     def activate_skill(self, name: str, prompt_body: str) -> None:
@@ -231,9 +257,12 @@ class Agent:
             else self._memory_text
         )
         stable_system = build_system_prompt(self._instruction_text, memory_text)
+        if self._instructions_content:
+            stable_system = stable_system + "\n\n" + self._instructions_content
 
         unknown_run = 0
-        for iteration in range(1, MAX_ITERATIONS + 1):
+        self._limit_reached = False
+        for iteration in range(1, self._max_turns + 1):
             yield AgentEvent(iter=iteration)
             if cancel.is_set():
                 _ensure_assistant_tail(conv, NOTICE_CANCELLED)
@@ -288,7 +317,8 @@ class Agent:
                 full = iteration == 1 or (iteration - 1) % PLAN_REMINDER_INTERVAL == 0
                 plan = plan_reminder(full)
             deferred = deferred_tools_reminder(self._registry.get_deferred_tool_names())
-            reminder = combine_reminders(recall_text, plan, deferred)
+            inbox_text = "\n\n".join(self.runtime.inbox.drain())
+            reminder = combine_reminders(recall_text, plan, deferred, inbox_text)
             dynamic_environment = "\n\n".join(
                 part
                 for part in (
@@ -462,9 +492,56 @@ class Agent:
                 yield AgentEvent(done=True)
                 return
 
+        self._limit_reached = True
         yield AgentEvent(notice=NOTICE_MAX_ITER)
         _ensure_assistant_tail(conv, NOTICE_MAX_ITER)
         yield AgentEvent(done=True)
+
+    async def run_to_completion(
+        self,
+        conv: Conversation,
+        task: str,
+        mode: Mode = Mode.DEFAULT,
+        cancel: asyncio.Event | None = None,
+    ) -> RunResult:
+        """追加任务后消费同一事件流，直到自然完成或到达轮数上限。"""
+
+        if task:
+            conv.add_user(task)
+        cancel_event = cancel if cancel is not None else asyncio.Event()
+        status = RunStatus.COMPLETED
+        final_text = ""
+        error: Exception | None = None
+        usage = Usage()
+        tool_count = 0
+        last_activity = ""
+        try:
+            async for event in self.run(conv, mode, cancel_event):
+                if event.text:
+                    final_text = event.text
+                if event.usage is not None:
+                    usage = event.usage
+                if event.tool is not None and event.tool.phase == Phase.END:
+                    tool_count += 1
+                    last_activity = event.tool.name
+                if event.err is not None:
+                    error = event.err
+                if event.done:
+                    break
+        except asyncio.CancelledError:
+            raise
+        if self._limit_reached:
+            status = RunStatus.LIMIT_REACHED
+        elif error is not None:
+            status = RunStatus.FAILED
+        return RunResult(
+            status=status,
+            final_text=final_text,
+            error=error,
+            usage=usage,
+            tool_count=tool_count,
+            last_activity=last_activity,
+        )
 
 
 def new_agent(

@@ -11,6 +11,7 @@ class Rule:
     tool: str
     pattern: str
     allow: bool
+    scope: str = "main-agent"
 
 
 @dataclass
@@ -38,11 +39,15 @@ class RuleSet:
         return Decision.ALLOW, False
 
 
-def parse_rule(value: str, allow: bool = True) -> tuple[Rule, bool]:
+def parse_rule(
+    value: str,
+    allow: bool = True,
+    scope: str = "main-agent",
+) -> tuple[Rule, bool]:
     match = re.fullmatch(r"([A-Za-z0-9_*-]+)(?:\((.*)\))?", value.strip())
     if match is None or not match.group(1):
-        return Rule("", "", allow), False
-    return Rule(match.group(1), match.group(2) or "", allow), True
+        return Rule("", "", allow, scope), False
+    return Rule(match.group(1), match.group(2) or "", allow, scope), True
 
 
 def match_pattern(pattern: str, target: str) -> bool:

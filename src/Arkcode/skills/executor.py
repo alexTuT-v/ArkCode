@@ -2,8 +2,11 @@
 
 import asyncio
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..agents import Agent, SessionRuntime
+from ..agents.identity import AgentIdentity
+from ..agents.parent import ParentContext
 from ..config import ProviderConfig, effective_context_window
 from ..context import (
     CompactCircuitBreaker,
@@ -16,6 +19,9 @@ from ..llm import Request, StreamError, TextDelta, new_provider
 from ..permissions import Engine, Mode
 from ..tools.registry import Registry
 from .parser import SkillMeta, substitute_arguments
+
+if TYPE_CHECKING:
+    from ..subagents.launcher import SubAgentLauncher
 
 SYSTEM_TOOL_NAMES = frozenset({"LoadSkill"})
 
@@ -32,6 +38,7 @@ class SkillExecutor:
         engine: Engine | None,
         version: str,
         work_dir: Path,
+        launcher: "SubAgentLauncher | None" = None,
     ) -> None:
         self._agent = agent
         self._conversation = conversation
@@ -40,6 +47,7 @@ class SkillExecutor:
         self._engine = engine
         self._version = version
         self._work_dir = work_dir
+        self._launcher = launcher
 
     def execute_inline(self, skill: SkillMeta, args: str) -> None:
         rendered = substitute_arguments(skill.prompt_body, args)
@@ -67,6 +75,64 @@ class SkillExecutor:
         )
 
     async def execute_fork(self, skill: SkillMeta, args: str) -> str:
+        if self._launcher is not None:
+            return await self._execute_fork_via_launcher(skill, args)
+        return await self._execute_fork_legacy(skill, args)
+
+    async def _execute_fork_via_launcher(self, skill: SkillMeta, args: str) -> str:
+        try:
+            assert self._launcher is not None
+            rendered = substitute_arguments(skill.prompt_body, args)
+            config = (
+                self._provider_config.model_copy(update={"model": skill.model})
+                if skill.model
+                else self._provider_config
+            )
+            provider = new_provider(config)
+            if skill.context == "recent":
+                base_messages = [
+                    message
+                    for message in self._conversation.messages()
+                    if message.role in {"user", "assistant"}
+                ][-5:]
+            elif skill.context == "full":
+                summary = await self._summarize(provider)
+                from ..llm import Message
+
+                base_messages = [Message(role="user", content=summary)]
+            else:
+                base_messages = []
+            from ..subagents.models import LaunchRequest
+
+            request = LaunchRequest(
+                prompt=rendered,
+                description=f"Skill fork: {skill.name}",
+                subagent_type=None,
+                model=skill.model,
+                run_in_background=False,
+                name=f"skill-fork-{skill.name}",
+            )
+            parent = ParentContext(
+                workspace=self._work_dir,
+                conversation=self._conversation,
+                identity=AgentIdentity.main(str(self._work_dir)),
+                registry=self._registry,
+                provider=provider,
+                provider_config=config,
+            )
+            outcome = await self._launcher.launch_fork(
+                request,
+                parent,
+                base_messages=base_messages,
+                run_in_background=False,
+            )
+            return outcome.final_text
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            return f"[skill {skill.name} failed: {error}]"
+
+    async def _execute_fork_legacy(self, skill: SkillMeta, args: str) -> str:
         try:
             rendered = substitute_arguments(skill.prompt_body, args)
             config = (

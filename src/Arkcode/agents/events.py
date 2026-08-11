@@ -33,6 +33,27 @@ class Usage:
     cache_write: int = 0
 
 
+class RunStatus(Enum):
+    """一次 RunToCompletion 执行的终态。"""
+
+    COMPLETED = "completed"
+    LIMIT_REACHED = "limit_reached"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True, slots=True)
+class RunResult:
+    """消费同一事件流汇总出的执行结果。"""
+
+    status: RunStatus
+    final_text: str
+    error: Exception | None
+    usage: Usage
+    tool_count: int
+    last_activity: str
+
+
 @dataclass(frozen=True)
 class ApprovalRequest:
     """等待界面回传单次权限选择。"""
@@ -41,6 +62,11 @@ class ApprovalRequest:
     args: str
     reason: str
     respond: asyncio.Future[Outcome]
+    agent_id: str = ""
+    agent_name: str = ""
+    agent_type: str = ""
+    job_id: str = ""
+    foreground: bool = False
 
 
 @dataclass(frozen=True)

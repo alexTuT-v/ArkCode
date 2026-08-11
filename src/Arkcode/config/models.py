@@ -25,9 +25,19 @@ class ProviderConfig(BaseModel):
     context_window: int = 0
 
 
+class Features(BaseModel):
+    """功能开关集合。"""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    coordinator_mode: bool = False
+
+
 class Config(BaseModel):
     """应用配置。"""
 
     model_config = ConfigDict(frozen=True, extra="ignore")
 
     providers: list[ProviderConfig]
+    features: Features = Field(default_factory=Features)
+    enable_subagent_background: bool = True

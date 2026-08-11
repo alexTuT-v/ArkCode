@@ -8,6 +8,7 @@ from ..llm import ToolCall
 from .blacklist import hits_blacklist
 from .rules import RuleSet
 from .sandbox import resolve_root, sandbox_ok
+from .scope import PermissionLedger, PermissionScope, match_scoped_rules
 from .settings import (
     Settings,
     categorize,
@@ -28,9 +29,31 @@ class Engine:
     local_path: str = ""
     _start_mode: Mode = Mode.DEFAULT
     sandbox_enabled: bool = False
+    scope: PermissionScope | None = None
+    ledger: PermissionLedger | None = None
 
     def start_mode(self) -> Mode:
         return self._start_mode
+
+    def child(
+        self,
+        scope: PermissionScope,
+        ledger: PermissionLedger,
+        mode: Mode,
+    ) -> "Engine":
+        """构造带独立作用域与临时账本的子权限引擎。"""
+
+        return Engine(
+            root=self.root,
+            user=self.user,
+            project=self.project,
+            local=self.local,
+            local_path=self.local_path,
+            _start_mode=mode,
+            sandbox_enabled=self.sandbox_enabled,
+            scope=scope,
+            ledger=ledger,
+        )
 
     def check(
         self,
@@ -47,29 +70,39 @@ class Engine:
                 return Decision.DENY, "无法解析文件路径参数，安全拒绝"
             if not sandbox_ok(self.root, target):
                 return Decision.DENY, f"路径在项目目录之外：{target}"
-        ask_hit = False
-        allow_hit = False
-        for rules in (self.local, self.project, self.user):
-            decision, hit = rules.match(
-                friendly_name(call.name), _relative(self.root, target, is_file)
-            )
-            if hit and decision is Decision.DENY:
+        current_scope = self.scope.value if self.scope is not None else "main-agent"
+        decision, hit = match_scoped_rules(
+            (self.local, self.project, self.user),
+            current_scope,
+            friendly_name(call.name),
+            _relative(self.root, target, is_file),
+        )
+        if hit:
+            if decision is Decision.DENY:
                 return (
                     decision,
                     f"匹配 deny 规则：{friendly_name(call.name)}({target})",
                 )
-            if hit and decision is Decision.ASK:
-                ask_hit = True
-            elif hit:
-                allow_hit = True
-        if ask_hit:
-            decision = Decision.ALLOW if self.sandbox_enabled else Decision.ASK
-            return decision, f"匹配 ask 规则：{friendly_name(call.name)}({target})"
-        if allow_hit:
+            if decision is Decision.ASK:
+                if self.sandbox_enabled:
+                    return (
+                        Decision.ALLOW,
+                        "匹配 ask 规则，已由沙箱自动放行",
+                    )
+                return decision, f"匹配 ask 规则：{friendly_name(call.name)}({target})"
             return (
                 Decision.ALLOW,
                 f"匹配 allow 规则：{friendly_name(call.name)}({target})",
             )
+        if self.ledger is not None:
+            ledger_decision, ledger_hit = self.ledger.match(
+                friendly_name(call.name),
+                _relative(self.root, target, is_file),
+            )
+            if ledger_hit:
+                if ledger_decision is Decision.DENY:
+                    return ledger_decision, "匹配本次 SubAgent 临时 deny 账本"
+                return ledger_decision, "匹配本次 SubAgent 临时 allow 账本"
         decision = mode_fallback(mode, category)
         if decision is Decision.ASK:
             if self.sandbox_enabled:
@@ -85,6 +118,15 @@ class Engine:
 
         persist_local_allow(self, call)
 
+    def persist_scoped_allow(
+        self,
+        call: ToolCall,
+        scope: PermissionScope | None,
+    ) -> None:
+        from .persist import persist_scoped_allow
+
+        persist_scoped_allow(self, call, scope)
+
 
 def _relative(root: str, target: str, is_file: bool) -> str:
     if not is_file or not target:
@@ -99,7 +141,11 @@ def _relative(root: str, target: str, is_file: bool) -> str:
 
 
 def mode_fallback(mode: Mode, category: Category) -> Decision:
-    if category is Category.READ or mode is Mode.BYPASS:
+    if (
+        category is Category.READ
+        or mode is Mode.BYPASS
+        or mode is Mode.DONT_ASK
+    ):
         return Decision.ALLOW
     if mode is Mode.ACCEPT_EDITS and category is Category.WRITE:
         return Decision.ALLOW

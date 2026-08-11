@@ -48,6 +48,7 @@ def status_bar(
         Mode.ACCEPT_EDITS: ("ACCEPT EDITS", "cyan"),
         Mode.PLAN: ("PLAN", "yellow"),
         Mode.BYPASS: ("BYPASS", "bold red"),
+        Mode.DONT_ASK: ("DONT ASK", "magenta"),
     }
     label, style = labels[mode]
     usage = (

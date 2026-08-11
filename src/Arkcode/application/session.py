@@ -9,10 +9,18 @@ from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ..subagents.approvals import ApprovalBroker
+    from ..subagents.catalog import Catalog
+    from ..subagents.launcher import SubAgentLauncher
+    from ..subagents.manager import TaskManager
 
 from ..agents import Agent, AgentEvent, SessionRuntime
-from ..config import ProviderConfig, effective_context_window
+from ..agents.identity import AgentIdentity, current_identity
+from ..agents.parent import ParentContext, parent_scope
+from ..config import Config, ProviderConfig, effective_context_window
 from ..context import (
     CompactCircuitBreaker,
     RecoveryState,
@@ -134,6 +142,12 @@ class SessionService:
         mcp_instructions: str = "",
         runtime: SessionRuntime | None = None,
         journal: SessionJournal | None = None,
+        config: Config | None = None,
+        provider_configs: list[ProviderConfig] | None = None,
+        task_manager: TaskManager | None = None,
+        catalog: Catalog | None = None,
+        approval_broker: ApprovalBroker | None = None,
+        launcher: SubAgentLauncher | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self._version = version
@@ -144,6 +158,13 @@ class SessionService:
         self._instruction_text = instruction_text
         self._memory_text = memory_text
         self._mcp_instructions = mcp_instructions
+        self._config = config
+        self._provider_configs = list(provider_configs or [])
+        self._provider_config: ProviderConfig | None = None
+        self.task_manager: TaskManager | None = task_manager
+        self.catalog: Catalog | None = catalog
+        self.approval_broker: ApprovalBroker | None = approval_broker
+        self.launcher: SubAgentLauncher | None = launcher
         self.runtime = runtime or SessionRuntime(
             recovery=RecoveryState(),
             auto_tracking=CompactCircuitBreaker(),
@@ -173,6 +194,9 @@ class SessionService:
         """创建 Provider、Agent 与 SkillExecutor，并完成模型分配。"""
 
         provider = new_provider(config)
+        self._provider_config = config
+        if config not in self._provider_configs:
+            self._provider_configs.append(config)
         self.sink.set_provider(config.name, provider.model)
         if self._memory is not None:
             self._memory.set_provider(provider, provider.model)
@@ -199,6 +223,7 @@ class SessionService:
             self._permissions,
             self._version,
             self.workspace,
+            launcher=self.launcher,
         )
         self.agent.set_skill_catalog(render_skill_catalog(self.skills.get_catalog()))
         self.mode = (
@@ -217,11 +242,36 @@ class SessionService:
         self._cancel = cancel
         self.conversation.add_user(text)
         try:
-            async for event in agent.run(self.conversation, self.mode, cancel):
-                yield event
+            with parent_scope(self.parent_context()):
+                async for event in agent.run(self.conversation, self.mode, cancel):
+                    yield event
         finally:
             if self._cancel is cancel:
                 self._cancel = asyncio.Event()
+
+    def parent_context(self) -> ParentContext:
+        """构造当前主 Agent 的父会话快照，供 Agent/Job 工具使用。"""
+
+        return ParentContext(
+            workspace=self.workspace,
+            conversation=self.conversation,
+            identity=self._main_identity(),
+            registry=self._registry,
+            provider=self.provider,
+            provider_config=self._provider_config,
+            config=self._config,
+        )
+
+    def _main_identity(self) -> AgentIdentity:
+        identity = current_identity()
+        if identity.source != "main":
+            return AgentIdentity.main(str(self.workspace))
+        return identity
+
+    def append_reminder(self, text: str) -> None:
+        """把系统提醒注入主 Agent 的 ReminderInbox，下一轮模型请求自然读取。"""
+
+        self.runtime.inbox.append(text)
 
     async def force_compact(self) -> tuple[int, int]:
         """对当前会话执行一次手动压缩。"""

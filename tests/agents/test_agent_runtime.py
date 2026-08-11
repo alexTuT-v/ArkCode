@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from Arkcode.agents import SessionRuntime
+from Arkcode.agents.runtime import ReminderInbox
 from Arkcode.context import (
     CompactCircuitBreaker,
     RecoveryState,
@@ -26,3 +27,19 @@ def test_reset_for_new_session_replaces_state_and_counters(tmp_path: Path) -> No
 
     assert current.session == next_context
     assert current.usage_anchor == current.anchor_msg_len == 0
+
+
+def test_reminder_inbox_is_fifo_and_drain_clears() -> None:
+    inbox = ReminderInbox()
+    inbox.append("第一条")
+    inbox.append("第二条")
+    assert inbox.drain() == ["第一条", "第二条"]
+    assert inbox.drain() == []
+
+
+def test_two_runtimes_have_independent_inboxes(tmp_path: Path) -> None:
+    first = runtime(tmp_path / "a")
+    second = runtime(tmp_path / "b")
+    first.inbox.append("只有 first 有")
+    assert len(first.inbox) == 1
+    assert len(second.inbox) == 0

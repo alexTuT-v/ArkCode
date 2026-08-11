@@ -8,10 +8,13 @@ class Mode(IntEnum):
     ACCEPT_EDITS = 1
     PLAN = 2
     BYPASS = 3
+    DONT_ASK = 4
     NORMAL = DEFAULT
 
     def __str__(self) -> str:
-        return ("default", "acceptEdits", "plan", "bypassPermissions")[self]
+        return ("default", "acceptEdits", "plan", "bypassPermissions", "dontAsk")[
+            self
+        ]
 
 
 class Decision(IntEnum):
@@ -30,6 +33,8 @@ class Outcome(IntEnum):
     DENY_ONCE = 0
     ALLOW_ONCE = 1
     ALLOW_FOREVER = 2
+    ALLOW_AGENT = 3
+    SAVE_PROJECT_RULE = 4
 
 
 def parse_mode(value: str) -> tuple[Mode, bool]:
