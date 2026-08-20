@@ -35,14 +35,18 @@ async def run_agent(tool: AgentTool, tmp_path, **params: object) -> str:
 
 @pytest.mark.asyncio
 async def test_agent_tool_unknown_type_error(tmp_path) -> None:
+    tool = make_tool(tmp_path)
+    tool._launcher._catalog._definitions.update(  # type: ignore[attr-defined]
+        {"explore": _definition(), "plan": _definition()}
+    )
     content = await run_agent(
-        make_tool(tmp_path),
+        tool,
         tmp_path,
         prompt="p",
         description="d",
         subagent_type="ghost",
     )
-    assert content == "未知 subagent_type: ghost"
+    assert content == "未知 subagent_type: ghost。可用类型: explore, plan"
 
 
 @pytest.mark.asyncio

@@ -77,3 +77,15 @@ class Catalog:
                 print(f"警告: 跳过 Agent 定义 {path}: {exc}", file=sys.stderr)
                 continue
             self._definitions[definition.name] = definition
+
+
+def unknown_type_message(catalog: Catalog | None, requested: str) -> str:
+    """生成包含当前可选角色的模型可纠错错误。"""
+
+    available = (
+        ", ".join(name for name, _ in catalog.list_definitions())
+        if catalog is not None
+        else ""
+    )
+    suffix = f"。可用类型: {available}" if available else ""
+    return f"未知 subagent_type: {requested}{suffix}"

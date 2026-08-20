@@ -21,7 +21,7 @@ from ..llm import Message, Provider, new_provider
 from ..permissions import Engine, Mode, parse_mode
 from ..permissions.scope import PermissionLedger, PermissionScope
 from .approvals import ApprovalBroker
-from .catalog import Catalog
+from .catalog import Catalog, unknown_type_message
 from .filter import RegistryView, build_policy
 from .fork import build_forked_messages
 from .manager import (
@@ -120,7 +120,9 @@ class SubAgentLauncher:
                 else None
             )
             if definition is None:
-                raise AgentToolError(f"未知 subagent_type: {request.subagent_type}")
+                raise AgentToolError(
+                    unknown_type_message(self._catalog, request.subagent_type)
+                )
         background = (
             request.run_in_background
             or (definition.background if definition is not None else False)

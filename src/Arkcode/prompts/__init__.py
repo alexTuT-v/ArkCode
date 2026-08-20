@@ -5,6 +5,7 @@ from .builder import (
     assemble_system,
     build_system_prompt,
     render_active_skills,
+    render_agent_catalog,
     render_skill_catalog,
 )
 from .environment import Environment, gather_environment
@@ -31,6 +32,7 @@ __all__ = [
     "optional_modules",
     "plan_reminder",
     "render_active_skills",
+    "render_agent_catalog",
     "render_skill_catalog",
     "system_reminder",
 ]

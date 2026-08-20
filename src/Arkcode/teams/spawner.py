@@ -19,6 +19,7 @@ from ..context import (
 from ..conversations import Conversation
 from ..permissions import Mode
 from ..permissions.scope import PermissionLedger, PermissionScope
+from ..subagents.catalog import unknown_type_message
 from ..subagents.filter import RegistryPolicy, RegistryView
 from ..subagents.launcher import AgentToolError, SubAgentLauncher
 from ..subagents.manager import new_agent_id
@@ -100,7 +101,10 @@ class TeamSpawner:
             )
             if definition is None:
                 return Result(
-                    f"未知 subagent_type: {request.subagent_type}",
+                    unknown_type_message(
+                        self._launcher._catalog,
+                        request.subagent_type,
+                    ),
                     is_error=True,
                 )
         else:

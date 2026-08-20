@@ -29,7 +29,7 @@ from ..conversations import Conversation
 from ..llm import Message, Provider, new_provider
 from ..memory import Manager
 from ..permissions import Engine, Mode
-from ..prompts import render_skill_catalog
+from ..prompts import render_agent_catalog, render_skill_catalog
 from ..sessions import (
     SessionInfo,
     SessionJournal,
@@ -253,6 +253,10 @@ class SessionService:
             self.workspace,
             launcher=self.launcher,
         )
+        agent_catalog = (
+            self.catalog.list_definitions() if self.catalog is not None else []
+        )
+        self.agent.set_agent_catalog(render_agent_catalog(agent_catalog))
         self.agent.set_skill_catalog(render_skill_catalog(self.skills.get_catalog()))
         self.mode = (
             self._permissions.start_mode()

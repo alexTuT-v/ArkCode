@@ -403,6 +403,26 @@ async def test_agent_rebuilds_skill_environment_between_iterations(
 
 
 @pytest.mark.asyncio
+async def test_agent_includes_agent_catalog_in_dynamic_environment(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider([[TextDelta("done"), end()]])
+    conversation = Conversation()
+    conversation.add_user("delegate this")
+    agent = Agent(provider, Registry(), runtime=runtime(tmp_path))
+    agent.set_agent_catalog(
+        "## Available Sub-Agent Types\n\n- explore: Read-only code search"
+    )
+
+    await collect(agent, conversation)
+
+    system = provider.requests[0].system
+    assert "Available Sub-Agent Types" in system.environment
+    assert "explore: Read-only code search" in system.environment
+    assert "Available Sub-Agent Types" not in system.stable
+
+
+@pytest.mark.asyncio
 async def test_load_skill_is_read_only_without_permission_approval(
     tmp_path: Path,
 ) -> None:

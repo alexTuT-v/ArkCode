@@ -1,4 +1,25 @@
-from Arkcode.prompts import render_active_skills, render_skill_catalog
+from Arkcode.prompts import (
+    render_active_skills,
+    render_agent_catalog,
+    render_skill_catalog,
+)
+
+
+def test_render_agent_catalog_lists_role_metadata_without_instructions() -> None:
+    rendered = render_agent_catalog(
+        [("explore", "Read-only code search"), ("plan", "Create a plan")]
+    )
+
+    assert rendered.startswith("## Available Sub-Agent Types")
+    assert "- explore: Read-only code search" in rendered
+    assert "- plan: Create a plan" in rendered
+    assert "subagent_type" in rendered
+    assert "fork the current conversation" in rendered
+    assert "secret role instructions" not in rendered
+
+
+def test_render_agent_catalog_is_empty_without_items() -> None:
+    assert render_agent_catalog([]) == ""
 
 
 def test_render_skill_catalog_lists_metadata_without_sop() -> None:

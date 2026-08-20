@@ -119,6 +119,7 @@ class Agent:
         self._permission_ledger = permission_ledger
         self._limit_reached = False
         self.active_skills: dict[str, str] = {}
+        self._agent_catalog = ""
         self._skill_catalog = ""
         self._run_lock = asyncio.Lock()
         self._executor = ToolExecutor(
@@ -140,6 +141,9 @@ class Agent:
 
     def set_skill_catalog(self, catalog: str) -> None:
         self._skill_catalog = catalog
+
+    def set_agent_catalog(self, catalog: str) -> None:
+        self._agent_catalog = catalog
 
     def _schedule_memory_update(
         self,
@@ -323,6 +327,7 @@ class Agent:
                 part
                 for part in (
                     environment.render(),
+                    self._agent_catalog,
                     self._skill_catalog,
                     render_active_skills(self.active_skills),
                 )

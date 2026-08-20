@@ -21,6 +21,27 @@ def build_system_prompt(instructions: str = "", memory: str = "") -> str:
     return assemble_system(fixed_modules() + optional_modules(instructions, memory))
 
 
+def render_agent_catalog(items: list[tuple[str, str]]) -> str:
+    """渲染供主模型选择定义式 SubAgent 的角色元数据。"""
+
+    if not items:
+        return ""
+    lines = [
+        "## Available Sub-Agent Types",
+        "",
+        "Use the Agent tool with subagent_type to delegate tasks:",
+        "",
+    ]
+    lines.extend(f"- {name}: {description}" for name, description in items)
+    lines.extend(
+        (
+            "",
+            "Leave subagent_type empty to fork the current conversation.",
+        )
+    )
+    return "\n".join(lines)
+
+
 def render_skill_catalog(items: list[tuple[str, str]]) -> str:
     """只渲染可用于渐进披露的 Skill 元数据。"""
 

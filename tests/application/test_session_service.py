@@ -157,6 +157,37 @@ def test_activate_provider_creates_agent_once(
     assert service.mode == Mode.DEFAULT
 
 
+def test_activate_provider_exposes_loaded_subagent_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from Arkcode.subagents.catalog import Catalog
+
+    provider = RecordingProvider()
+    monkeypatch.setattr(session_module, "new_provider", lambda _: provider)
+    catalog = Catalog(project_root=tmp_path, user_root=tmp_path)
+    catalog.load()
+    engine, error = new_engine(str(tmp_path))
+    assert error is None
+    skills = SkillLoader(tmp_path)
+    skills.load_all()
+    service = SessionService(
+        workspace=tmp_path,
+        version="0.1.0",
+        registry=new_default_registry(),
+        permissions=engine,
+        skills=skills,
+        catalog=catalog,
+    )
+
+    service.activate_provider(config())
+
+    assert service.agent is not None
+    assert "## Available Sub-Agent Types" in service.agent._agent_catalog
+    assert "- explore: 只读探索角色" in service.agent._agent_catalog
+    assert "- plan: 只读规划角色" in service.agent._agent_catalog
+
+
 def test_create_writes_format_v2_meta(tmp_path: Path) -> None:
     service = make_service(tmp_path)
 
